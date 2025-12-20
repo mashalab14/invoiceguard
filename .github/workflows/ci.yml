@@ -1,0 +1,107 @@
+name: InvoiceGuard CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Build Docker image
+      run: |
+        docker build -t invoiceguard:test . 2>&1 | tee build.log
+        echo "Checking build logs for required outputs..."
+        grep -q "SHA256" build.log || exit 1
+        grep -q "Selected UBL:" build.log || exit 1
+        grep -q "Selected CII:" build.log || exit 1
+        echo "✅ Build validation passed"
+    
+    - name: Start container
+      run: |
+        docker run -d -p 8080:8080 --name invoiceguard-test invoiceguard:test
+        
+        # Wait for service to be ready
+        echo "Waiting for service..."
+        for i in {1..30}; do
+          if curl -s http://localhost:8080/health > /dev/null 2>&1; then
+            echo "✅ Service is ready"
+            break
+          fi
+          sleep 1
+          if [ $i -eq 30 ]; then
+            echo "❌ Service failed to start"
+            docker logs invoiceguard-test
+            exit 1
+          fi
+        done
+    
+    - name: Test XML integrity
+      run: |
+        echo "Testing UBL file integrity..."
+        docker exec invoiceguard-test python -c "import xml.etree.ElementTree as ET; ET.parse('/app/test_ubl.xml')"
+        echo "Testing CII file integrity..."
+        docker exec invoiceguard-test python -c "import xml.etree.ElementTree as ET; ET.parse('/app/test_cii.xml')"
+        echo "✅ XML integrity tests passed"
+    
+    - name: Test UBL validation
+      run: |
+        echo "Testing UBL validation..."
+        RESPONSE=$(docker exec invoiceguard-test curl -s -X POST http://localhost:8080/validate -F "file=@/app/test_ubl.xml")
+        echo "Response: $RESPONSE"
+        echo "$RESPONSE" | grep -q '"status":"PASSED"\|"status": "PASSED"' || exit 1
+        echo "✅ UBL validation passed"
+    
+    - name: Test CII validation
+      run: |
+        echo "Testing CII validation..."
+        RESPONSE=$(docker exec invoiceguard-test curl -s -X POST http://localhost:8080/validate -F "file=@/app/test_cii.xml")
+        echo "Response: $RESPONSE"
+        echo "$RESPONSE" | grep -q '"status":"PASSED"\|"status": "PASSED"' || exit 1
+        echo "✅ CII validation passed"
+    
+    - name: Test invalid XML handling
+      run: |
+        echo "Testing invalid XML handling..."
+        echo "not xml" > /tmp/invalid.txt
+        HTTP_CODE=$(curl -s -o /tmp/response.json -w "%{http_code}" http://localhost:8080/validate -F "file=@/tmp/invalid.txt")
+        RESPONSE=$(cat /tmp/response.json)
+        echo "HTTP Code: $HTTP_CODE"
+        echo "Response: $RESPONSE"
+        echo "$RESPONSE" | grep -q '"status":"ERROR"\|"status": "ERROR"' || exit 1
+        echo "✅ Invalid XML handling passed"
+    
+    - name: Test file size limit
+      run: |
+        echo "Testing file size limit..."
+        dd if=/dev/zero of=/tmp/large.xml bs=1M count=11 2>/dev/null
+        HTTP_CODE=$(curl -s -o /tmp/response.json -w "%{http_code}" http://localhost:8080/validate -F "file=@/tmp/large.xml")
+        echo "HTTP Code: $HTTP_CODE"
+        if [ "$HTTP_CODE" = "413" ]; then
+          echo "✅ File size limit test passed"
+        else
+          echo "❌ Expected HTTP 413, got $HTTP_CODE"
+          exit 1
+        fi
+    
+    - name: Show container logs
+      if: always()
+      run: |
+        echo "Container logs:"
+        docker logs invoiceguard-test
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        docker stop invoiceguard-test || true
+        docker rm invoiceguard-test || true
