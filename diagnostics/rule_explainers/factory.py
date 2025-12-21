@@ -1,11 +1,11 @@
 from typing import Optional
 from diagnostics.rule_explainers.base import BaseExplainer
+from diagnostics.rule_explainers.br_co_15 import BrCo15Explainer
 import logging
 
 logger = logging.getLogger(__name__)
 
 # Import concrete explainer classes here
-# from diagnostics.rule_explainers.br_co_15 import BrCo15Explainer
 # Add more imports as explainers are implemented
 
 class ExplainerFactory:
@@ -13,7 +13,7 @@ class ExplainerFactory:
     
     # Static registry mapping IDs to explainer instances
     REGISTRY = {
-        # "BR-CO-15": BrCo15Explainer(),
+        "BR-CO-15": BrCo15Explainer(),
         # Add more explainers here as they are implemented
     }
     
