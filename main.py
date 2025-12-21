@@ -306,15 +306,26 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
             debug_log=None
         )
     
-    # Parse validation report
-    report_path = os.path.join(output_dir, "input.xml-report.xml")
-    logger.debug(f"Session {session_id}: Looking for report at: {report_path}")
+    # Parse validation report - find the actual report file
+    # The KoSIT validator generates input-report.xml (not input.xml-report.xml)
+    report_path = None
     
-    if not os.path.exists(report_path):
+    if os.path.exists(output_dir):
+        output_files = os.listdir(output_dir)
+        logger.debug(f"Session {session_id}: Files in output directory: {output_files}")
+        
+        # Look for the report file with different possible names
+        for filename in output_files:
+            if filename in ["input-report.xml", "input.xml-report.xml"] or filename.endswith("-report.xml"):
+                report_path = os.path.join(output_dir, filename)
+                logger.debug(f"Session {session_id}: Found report file: {filename}")
+                break
+    
+    if not report_path or not os.path.exists(report_path):
         # List files in output directory for debugging
         if os.path.exists(output_dir):
             output_files = os.listdir(output_dir)
-            logger.error(f"Session {session_id}: Output directory exists but report missing. Files: {output_files}")
+            logger.error(f"Session {session_id}: No valid report file found. Files: {output_files}")
         else:
             logger.error(f"Session {session_id}: Output directory does not exist: {output_dir}")
         
@@ -338,6 +349,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
         )
     
     # Parse report XML
+    logger.debug(f"Session {session_id}: Parsing report file: {report_path}")
     try:
         tree = ET.parse(report_path)
         root = tree.getroot()
