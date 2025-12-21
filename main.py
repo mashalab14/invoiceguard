@@ -111,6 +111,15 @@ async def health_check():
     return {"status": "healthy"}
 
 
+@app.get("/")
+async def root():
+    return {
+        "message": "InvoiceGuard API is running",
+        "docs": "/docs",
+        "health": "/health"
+    }
+
+
 @app.post("/validate", response_model=ValidationResponse)
 async def validate_invoice(file: UploadFile = File(...)):
     """
