@@ -17,6 +17,9 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+# Enhanced imports
+from diagnostics.pipeline import DiagnosticsPipeline
+
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,  # Changed from INFO to DEBUG for better troubleshooting
@@ -24,11 +27,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global configuration
-VALIDATOR_JAR = "/app/validator.jar"
-VERSION_INFO_FILE = "/app/version_info.txt"
-RULES_DIR_FILE = "/app/rules_dir.txt"
-TEMP_DIR = "/app/temp"
+# Global configuration with environment variable support
+VALIDATOR_JAR = os.environ.get("VALIDATOR_JAR", "/app/validator.jar")
+VERSION_INFO_FILE = os.environ.get("VERSION_INFO_FILE", "/app/version_info.txt")
+RULES_DIR_FILE = os.environ.get("RULES_DIR_FILE", "/app/rules_dir.txt")
+TEMP_DIR = os.environ.get("TEMP_DIR", "/app/temp")
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 VALIDATION_TIMEOUT = 30  # seconds
 
@@ -42,6 +45,10 @@ app = FastAPI(title="InvoiceGuard", version="1.0.0")
 class ValidationError(BaseModel):
     code: str
     message: str
+    location: Optional[str] = None
+    severity: Optional[str] = None
+    humanized_message: Optional[str] = None
+    suppressed: Optional[bool] = None
 
 
 class ValidationMeta(BaseModel):
@@ -69,13 +76,15 @@ def load_config():
         with open(RULES_DIR_FILE, 'r') as f:
             rules_dir = f.read().strip()
         
-        # Verify files exist
-        if not os.path.exists(VALIDATOR_JAR):
-            raise FileNotFoundError(f"Validator JAR not found: {VALIDATOR_JAR}")
-        
-        scenarios_file = os.path.join(rules_dir, "scenarios.xml")
-        if not os.path.exists(scenarios_file):
-            raise FileNotFoundError(f"Scenarios file not found: {scenarios_file}")
+        # In development mode, skip file existence checks
+        if not os.environ.get("DEV_MODE"):
+            # Verify files exist (only in production)
+            if not os.path.exists(VALIDATOR_JAR):
+                raise FileNotFoundError(f"Validator JAR not found: {VALIDATOR_JAR}")
+            
+            scenarios_file = os.path.join(rules_dir, "scenarios.xml")
+            if not os.path.exists(scenarios_file):
+                raise FileNotFoundError(f"Scenarios file not found: {scenarios_file}")
         
         logger.info(f"Validator Ready. Rules Commit: {commit_hash}")
         logger.info(f"Rules Directory: {rules_dir}")
@@ -91,6 +100,10 @@ def load_config():
 
 # Load config on startup
 config = load_config()
+
+# Initialize humanization pipeline
+diagnostics_pipeline = DiagnosticsPipeline()
+logger.info("Humanization layer initialized")
 
 # Ensure temp directory exists
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -422,9 +435,16 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
         
         message = text_elem.text if text_elem is not None and text_elem.text else "Validation failed"
         
+        # Extract location (location attribute)
+        location = failed_assert.get('location', '')
+        
         errors.append(ValidationError(
             code=error_code,
-            message=message.strip()
+            message=message.strip(),
+            location=location,
+            severity="error",
+            humanized_message=None,
+            suppressed=False
         ))
     
     # Proof of execution check
@@ -440,6 +460,52 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
         
         if not active_patterns and not fired_rules:
             logger.warning(f"Session {session_id}: No failed-assert and no execution proof found")
+    
+    # Apply humanization layer to enhance error messages
+    if errors:
+        try:
+            logger.debug(f"Session {session_id}: Applying humanization layer to {len(errors)} errors")
+            
+            # Read the original input file for context
+            with open(input_path, 'rb') as f:
+                invoice_xml = f.read()
+            
+            # Convert errors to the format expected by humanization pipeline
+            kosit_errors = []
+            for error in errors:
+                kosit_errors.append({
+                    "id": error.code,
+                    "message": error.message,
+                    "location": error.location or "",
+                    "severity": error.severity or "error"
+                })
+            
+            # Run humanization pipeline
+            humanization_result = diagnostics_pipeline.run(kosit_errors, invoice_xml)
+            
+            # Update errors with humanization results
+            enhanced_errors = []
+            for processed_error in humanization_result.processed_errors:
+                enhanced_errors.append(ValidationError(
+                    code=processed_error["id"],
+                    message=processed_error["message"],
+                    location=processed_error.get("location", ""),
+                    severity=processed_error.get("severity", "error"),
+                    humanized_message=processed_error.get("humanized_message"),
+                    suppressed=processed_error.get("suppressed", False)
+                ))
+            
+            # Replace original errors with enhanced errors
+            errors = enhanced_errors
+            
+            # Log humanization statistics
+            enriched_count = sum(1 for e in errors if e.humanized_message)
+            suppressed_count = sum(1 for e in errors if e.suppressed)
+            logger.info(f"Session {session_id}: Humanization completed - {enriched_count} enriched, {suppressed_count} suppressed")
+            
+        except Exception as e:
+            logger.error(f"Session {session_id}: Humanization failed: {e}")
+            # Continue with original errors if humanization fails
     
     # Determine status
     if errors:
