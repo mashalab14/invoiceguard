@@ -278,11 +278,17 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
         
         # Check return code
         if process.returncode != 0:
+            # CAPTURE BOTH STREAMS
             stderr_text = stderr.decode('utf-8', errors='replace')
-            stderr_lines = stderr_text.strip().split('\n')
-            last_20_lines = '\n'.join(stderr_lines[-20:])
+            stdout_text = stdout.decode('utf-8', errors='replace')
             
+            # Combine them so we can see the real error
+            combined_log = f"--- STDOUT ---\n{stdout_text}\n\n--- STDERR ---\n{stderr_text}"
+            
+            # Log the last 50 lines to the console for Railway visibility
             logger.error(f"Session {session_id}: Validator crashed (exit code {process.returncode})")
+            logger.error(f"Session {session_id}: Output dump:\n{combined_log[-2000:]}")
+
             return ValidationResponse(
                 status="ERROR",
                 meta=ValidationMeta(
@@ -294,7 +300,8 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                     code="VALIDATOR_CRASH",
                     message="Internal validator crash"
                 )],
-                debug_log=last_20_lines
+                # RETURN THE COMBINED LOG TO YOUR CURL CLIENT
+                debug_log=combined_log[-4000:] 
             )
         
         logger.info(f"Session {session_id}: Validator completed successfully")
