@@ -1,6 +1,6 @@
 # InvoiceGuard - Peppol BIS 3.0 Pre-flight Validator
 # Base: Python 3.9 with Java 17
-FROM python:3.9-slim
+FROM python:3.9-slim-bookworm
 
 # Set bash as default shell with strict error handling
 SHELL ["/bin/bash", "-c"]
