@@ -37,11 +37,11 @@ RUN set -euo pipefail; \
         exit 1; \
     fi; \
     JAR_FILE=$(find /app/validator_dist -type f -name "validationtool-*-standalone.jar" ! -name "*java8*"); \
-    echo "[BUILD] Moving JAR: $JAR_FILE -> /app/validator.jar"; \
-    mv "$JAR_FILE" /app/validator.jar; \
+    echo "[BUILD] Creating Symlink: $JAR_FILE -> /app/validator.jar"; \
+    ln -s "$JAR_FILE" /app/validator.jar; \
     echo "[BUILD] Computing SHA256..."; \
-    sha256sum /app/validator.jar; \
-    rm -rf /app/validator_dist
+    sha256sum /app/validator.jar
+    # CRITICAL: We do NOT delete /app/validator_dist because the JAR needs the 'lib' folder inside it.
 
 # Step 2: Install Peppol Rules (release-3.0.18)
 # MODIFIED: Removed strict check for 'cii' folder
