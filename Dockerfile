@@ -115,8 +115,19 @@ RUN set -euo pipefail; \
     fi
 
 # Copy application files
+# Copy application files
 COPY requirements.txt /app/
 COPY main.py /app/
+
+# --- NEW: Copy the Humanization Layer modules ---
+COPY diagnostics /app/diagnostics
+COPY common /app/common
+COPY config /app/config
+# ------------------------------------------------
+
+# --- NEW: Fix the Import Path ---
+ENV PYTHONPATH=/app
+# --------------------------------
 
 # Install Python dependencies
 RUN set -euo pipefail; \
