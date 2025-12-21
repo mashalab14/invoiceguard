@@ -11,6 +11,7 @@ RUN set -euo pipefail; \
     apt-get install -y --no-install-recommends \
         openjdk-17-jre-headless \
         wget \
+        curl \        
         unzip \
         git \
         findutils \
