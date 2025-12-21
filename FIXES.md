@@ -10,7 +10,26 @@ The runtime validation was failing with "Report missing" error due to subprocess
 
 ## Fixes Applied ✅
 
-### 1. Fixed Subprocess Working Directory
+### 1. Fixed Report Filename Detection (CRITICAL) 🎯
+**Problem**: Code looked for `input.xml-report.xml` but KoSIT validator generates `input-report.xml`
+
+```python
+# BEFORE - Hardcoded filename
+report_path = os.path.join(output_dir, "input.xml-report.xml")
+
+# AFTER - Dynamic search for actual file
+report_path = None
+if os.path.exists(output_dir):
+    output_files = os.listdir(output_dir)
+    # Look for the report file with different possible names
+    for filename in output_files:
+        if filename in ["input-report.xml", "input.xml-report.xml"] or filename.endswith("-report.xml"):
+            report_path = os.path.join(output_dir, filename)
+            logger.debug(f"Found report file: {filename}")
+            break
+```
+
+### 2. Fixed Subprocess Working Directory
 ```python
 # BEFORE
 process = await asyncio.create_subprocess_exec(
@@ -28,7 +47,7 @@ process = await asyncio.create_subprocess_exec(
 )
 ```
 
-### 2. Explicit Output Directory Creation
+### 3. Explicit Output Directory Creation
 ```python
 # BEFORE
 session_dir = os.path.dirname(input_path)
