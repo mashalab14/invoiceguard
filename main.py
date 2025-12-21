@@ -314,11 +314,17 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
         output_files = os.listdir(output_dir)
         logger.debug(f"Session {session_id}: Files in output directory: {output_files}")
         
-        # Look for the report file with different possible names
+        # Look for the report file - prioritize the exact filename KoSIT generates
         for filename in output_files:
-            if filename in ["input-report.xml", "input.xml-report.xml"] or filename.endswith("-report.xml"):
+            # First check for the exact filename KoSIT validator generates
+            if filename == "input-report.xml":
                 report_path = os.path.join(output_dir, filename)
-                logger.debug(f"Session {session_id}: Found report file: {filename}")
+                logger.debug(f"Session {session_id}: Found KoSIT report file: {filename}")
+                break
+            # Fallback to other possible names
+            elif filename in ["input.xml-report.xml"] or filename.endswith("-report.xml"):
+                report_path = os.path.join(output_dir, filename)
+                logger.debug(f"Session {session_id}: Found alternative report file: {filename}")
                 break
     
     if not report_path or not os.path.exists(report_path):
