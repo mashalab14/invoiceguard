@@ -506,10 +506,41 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
             logger.error(f"Session {session_id}: Humanization failed: {e}")
             # Continue with original errors if humanization fails
     
-    # Determine status
+# Determine status
     if errors:
         validation_status = "REJECTED"
         logger.info(f"Session {session_id}: Validation REJECTED ({len(errors)} error(s))")
+    
+    # --- SAFETY CATCH START ---
+    elif process.returncode != 0:
+        # The Java tool crashed or rejected the file, but our XML parser found 0 errors.
+        # This prevents "False Positives" (Passing a bad file).
+        validation_status = "ERROR"
+        logger.error(f"Session {session_id}: Validator exited with error code {process.returncode} but no SVRL errors were parsed.")
+        
+        # Capture the stderr to show what went wrong
+        stderr_text = stderr.decode('utf-8', errors='replace')
+        
+        errors.append(ValidationError(
+            code="PARSING_MISMATCH",
+            message="The validator rejected the file, but the report could not be parsed. Check the debug log.",
+            severity="fatal",
+            humanized_message="System Error: The validator rejected this file, but we could not read the error report."
+        ))
+        
+        # Attach the raw log so you can debug WHY the parsing failed
+        return ValidationResponse(
+            status="ERROR",
+            meta=ValidationMeta(
+                engine="KoSIT 1.5.0",
+                rules_tag="release-3.0.18",
+                commit=config["commit_hash"]
+            ),
+            errors=errors,
+            debug_log=f"STDOUT:\n{stdout.decode('utf-8', errors='replace')}\n\nSTDERR:\n{stderr_text}"
+        )
+    # --- SAFETY CATCH END ---
+
     else:
         validation_status = "PASSED"
         logger.info(f"Session {session_id}: Validation PASSED")
