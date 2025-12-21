@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import fcntl
+import time
 from pathlib import Path
 from typing import Dict, List, Set
 from diagnostics.types import ErrorItem
@@ -27,21 +29,24 @@ class DependencyFilter:
             return False
     
     def _load_dependencies(self) -> None:
-        """Load dependencies configuration from JSON file with hot-reload support."""
+        """Load dependencies configuration from JSON file with atomic read and file locking."""
         try:
-            # Update last modified time
+            # Update last modified time first
             self._last_modified = os.path.getmtime(self._config_path)
             
-            with open(self._config_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            # Atomic read with file locking to prevent race conditions during high traffic
+            config_data = self._atomic_read_config()
+            if config_data is None:
+                logger.warning("Failed to read config file atomically, keeping current configuration")
+                return
                 
             # Validate schema: Dict[str, List[str]]
-            if not isinstance(data, dict):
-                logger.warning(f"Invalid dependencies config: expected dict, got {type(data).__name__}")
+            if not isinstance(config_data, dict):
+                logger.warning(f"Invalid dependencies config: expected dict, got {type(config_data).__name__}")
                 return
             
             new_dependencies = {}
-            for parent_id, child_list in data.items():
+            for parent_id, child_list in config_data.items():
                 if not isinstance(parent_id, str):
                     logger.warning(f"Invalid parent ID type: {type(parent_id).__name__}, skipping")
                     continue
@@ -77,6 +82,60 @@ class DependencyFilter:
             logger.error(f"Invalid JSON in dependencies config: {e}")
         except Exception as e:
             logger.error(f"Failed to load dependencies config: {e}")
+    
+    def _atomic_read_config(self) -> dict:
+        """
+        Atomically read configuration file with file locking to prevent race conditions.
+        
+        Returns:
+            dict: Parsed JSON configuration, or None if read fails
+        """
+        max_retries = 3
+        retry_delay = 0.1  # 100ms
+        
+        for attempt in range(max_retries):
+            try:
+                with open(self._config_path, 'r', encoding='utf-8') as f:
+                    # Acquire shared lock for reading (multiple readers, no writers)
+                    fcntl.flock(f.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    
+                    try:
+                        # Read entire file content first
+                        content = f.read()
+                        
+                        # Parse JSON from complete content (not streaming)
+                        data = json.loads(content)
+                        
+                        logger.debug(f"Successfully loaded config atomically (attempt {attempt + 1})")
+                        return data
+                        
+                    finally:
+                        # Always release the lock
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                        
+            except (OSError, IOError) as e:
+                if e.errno == 11:  # EAGAIN - file is locked by writer
+                    logger.debug(f"Config file locked by writer, retrying in {retry_delay}s (attempt {attempt + 1})")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                else:
+                    logger.warning(f"File system error reading config: {e}")
+                    break
+                    
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON decode error in config file: {e}")
+                # On decode error, try once more in case file was partially written
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                break
+                
+            except Exception as e:
+                logger.warning(f"Unexpected error reading config: {e}")
+                break
+        
+        return None
     
     def reload_if_changed(self) -> bool:
         """
