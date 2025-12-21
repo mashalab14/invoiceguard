@@ -289,19 +289,20 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                 debug_log=None
             )
         
-        # Check return code
-        if process.returncode != 0:
-            # CAPTURE BOTH STREAMS
+        # 1. First, check if a report file was generated
+        report_path = None
+        if os.path.exists(output_dir):
+            for filename in os.listdir(output_dir):
+                if filename == "input-report.xml" or filename.endswith("-report.xml"):
+                    report_path = os.path.join(output_dir, filename)
+                    break
+        
+        # 2. If NO report exists AND exit code is bad, THEN it's a crash
+        if not report_path and process.returncode != 0:
             stderr_text = stderr.decode('utf-8', errors='replace')
             stdout_text = stdout.decode('utf-8', errors='replace')
-            
-            # Combine them so we can see the real error
             combined_log = f"--- STDOUT ---\n{stdout_text}\n\n--- STDERR ---\n{stderr_text}"
-            
-            # Log the last 50 lines to the console for Railway visibility
             logger.error(f"Session {session_id}: Validator crashed (exit code {process.returncode})")
-            logger.error(f"Session {session_id}: Output dump:\n{combined_log[-2000:]}")
-
             return ValidationResponse(
                 status="ERROR",
                 meta=ValidationMeta(
@@ -309,13 +310,11 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                     rules_tag="release-3.0.18",
                     commit=config["commit_hash"]
                 ),
-                errors=[ValidationError(
-                    code="VALIDATOR_CRASH",
-                    message="Internal validator crash"
-                )],
-                # RETURN THE COMBINED LOG TO YOUR CURL CLIENT
-                debug_log=combined_log[-4000:] 
+                errors=[ValidationError(code="VALIDATOR_CRASH", message="Internal validator crash")],
+                debug_log=combined_log[-4000:]
             )
+        # 3. If we are here, we either have a report OR returncode was 0.
+        # Proceed to parse the report (even if returncode was 1).
         
         logger.info(f"Session {session_id}: Validator completed successfully")
     
