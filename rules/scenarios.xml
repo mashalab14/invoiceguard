@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<scenarios>
+  <scenario name="peppol-bis-3">
+    <name>PEPPOL BIS 3.0</name>
+    <description>Development test scenario</description>
+  </scenario>
+</scenarios>
