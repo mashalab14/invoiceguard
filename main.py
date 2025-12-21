@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Changed from INFO to DEBUG for better troubleshooting
     format='[%(levelname)s] %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -195,6 +195,10 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
     session_dir = os.path.dirname(input_path)
     output_dir = os.path.join(session_dir, "output")
     
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+    logger.debug(f"Session {session_id}: Created output directory: {output_dir}")
+    
     # Pre-flight check: Validate input XML
     try:
         ET.parse(input_path)
@@ -227,13 +231,17 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
     ]
     
     logger.info(f"Session {session_id}: Executing KoSIT validator...")
+    logger.debug(f"Session {session_id}: Command: {' '.join(cmd)}")
+    logger.debug(f"Session {session_id}: Working directory: /app")
+    logger.debug(f"Session {session_id}: Output directory: {output_dir}")
     
     # Execute Java validator
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            cwd="/app"  # Set working directory to /app so JAR can find lib folder
         )
         
         try:
@@ -300,10 +308,21 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
     
     # Parse validation report
     report_path = os.path.join(output_dir, "input.xml-report.xml")
+    logger.debug(f"Session {session_id}: Looking for report at: {report_path}")
     
     if not os.path.exists(report_path):
+        # List files in output directory for debugging
+        if os.path.exists(output_dir):
+            output_files = os.listdir(output_dir)
+            logger.error(f"Session {session_id}: Output directory exists but report missing. Files: {output_files}")
+        else:
+            logger.error(f"Session {session_id}: Output directory does not exist: {output_dir}")
+        
         stderr_text = stderr.decode('utf-8', errors='replace')
+        stdout_text = stdout.decode('utf-8', errors='replace')
         logger.error(f"Session {session_id}: Report file missing")
+        logger.debug(f"Session {session_id}: STDOUT: {stdout_text}")
+        logger.debug(f"Session {session_id}: STDERR: {stderr_text}")
         return ValidationResponse(
             status="ERROR",
             meta=ValidationMeta(
@@ -315,7 +334,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                 code="REPORT_MISSING",
                 message="Report missing"
             )],
-            debug_log=stderr_text
+            debug_log=f"STDOUT: {stdout_text}\nSTDERR: {stderr_text}"
         )
     
     # Parse report XML
