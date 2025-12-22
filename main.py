@@ -271,6 +271,48 @@ def _deduplicate_errors(errors: List[ValidationError], session_id: str) -> List[
     return deduplicated
 
 
+def _apply_cross_error_suppression(errors: List[ValidationError], session_id: str) -> List[ValidationError]:
+    """
+    Apply cross-error suppression logic.
+    
+    If PEPPOL-EN16931-R051 (Currency Mismatch) is present, BR-CO-15 (Math Error) 
+    is almost certainly a side effect. Suppress BR-CO-15 so the user focuses on 
+    the root cause (currency mismatch).
+    
+    Args:
+        errors: List of validation errors
+        session_id: Session ID for logging
+        
+    Returns:
+        List of errors with suppression applied
+    """
+    if not errors:
+        return errors
+    
+    # Check if R051 (currency mismatch) is present
+    has_r051 = any(e.id == "PEPPOL-EN16931-R051" for e in errors)
+    
+    if not has_r051:
+        return errors
+    
+    # Suppress BR-CO-15 errors if R051 is present
+    suppressed_count = 0
+    for error in errors:
+        if error.id == "BR-CO-15" and not error.suppressed:
+            error.suppressed = True
+            # Append suppression reason to both message and humanized_message
+            suppression_note = " (Suppressed: Root cause is likely the Currency Mismatch R051)."
+            error.message = error.message + suppression_note
+            if error.humanized_message:
+                error.humanized_message = error.humanized_message + suppression_note
+            suppressed_count += 1
+    
+    if suppressed_count > 0:
+        logger.info(f"Session {session_id}: Cross-error suppression - suppressed {suppressed_count} BR-CO-15 error(s) due to R051 currency mismatch")
+    
+    return errors
+
+
 async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
     """
     Execute validation logic for a single file.
@@ -586,6 +628,9 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
             
             # Deduplicate errors - group repeated errors by ID
             errors = _deduplicate_errors(errors, session_id)
+            
+            # Apply cross-error suppression logic
+            errors = _apply_cross_error_suppression(errors, session_id)
             
         except Exception as e:
             logger.error(f"Session {session_id}: Humanization failed: {e}")

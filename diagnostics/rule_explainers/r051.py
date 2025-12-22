@@ -21,8 +21,9 @@ class R051Explainer(BaseExplainer):
             
             if not xml_tree:
                 error["humanized_message"] = (
-                    "Currency Code Mismatch. The Document Currency Code (BT-5) must match "
-                    "the currencyID attribute on all monetary amounts in the invoice."
+                    "Currency Conflict. The Document Currency Code (BT-5) and the currencyID attributes "
+                    "on monetary amounts are inconsistent. Please decide which currency is correct "
+                    "and make them consistent throughout the invoice."
                 )
                 return error
             
@@ -49,29 +50,25 @@ class R051Explainer(BaseExplainer):
                     logger.debug(f"XPath {xpath} failed: {e}")
                     continue
             
-            # Build explanation
+            # Build explanation - neutral, not prescriptive
             if document_currency:
                 error["humanized_message"] = (
-                    f"Currency Code Mismatch. The Document Currency Code (BT-5) is set to '{document_currency}', "
-                    "but one or more monetary amounts in the invoice have a different currencyID attribute. "
-                    "Action: Check all cbc:TaxExclusiveAmount, cbc:TaxInclusiveAmount, cbc:PayableAmount, "
-                    "and other monetary fields to ensure their currencyID attribute matches the Document Currency Code. "
-                    f"All currencyID attributes should be '{document_currency}'."
+                    f"Currency Conflict. The Document Currency Code (BT-5) is '{document_currency}', "
+                    "but amounts use a different currencyID. Please decide which currency is correct "
+                    "and make them consistent (either update BT-5, or update the currencyID on all amounts)."
                 )
             else:
                 error["humanized_message"] = (
-                    "Currency Code Mismatch. The Document Currency Code (BT-5) must match "
-                    "the currencyID attribute on all monetary amounts. "
-                    "Action: Verify your cbc:DocumentCurrencyCode element and ensure all monetary "
-                    "amounts (cbc:TaxExclusiveAmount, cbc:TaxInclusiveAmount, cbc:PayableAmount, etc.) "
-                    "have matching currencyID attributes."
+                    "Currency Conflict. The Document Currency Code (BT-5) and the currencyID attributes "
+                    "on monetary amounts are inconsistent. Please decide which currency is correct "
+                    "and make them consistent throughout the invoice."
                 )
                 
         except Exception as e:
             logger.warning(f"Failed to enrich R051 error: {e}")
             error["humanized_message"] = (
-                "Currency Code Mismatch. The Document Currency Code (BT-5) must match "
-                "the currencyID attribute on all monetary amounts in the invoice."
+                "Currency Conflict. The Document Currency Code (BT-5) and currencyID attributes "
+                "on amounts are inconsistent. Please make them consistent."
             )
         
         return error
