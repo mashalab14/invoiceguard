@@ -172,6 +172,17 @@ async def validate_invoice(file: UploadFile = File(...)):
         raise
     except Exception as e:
         logger.error(f"Session {session_id}: Unexpected error: {e}")
+        
+        # Create INTERNAL_ERROR with tiered structure
+        internal_error = {
+            "id": "INTERNAL_ERROR",
+            "message": f"Unexpected error: {str(e)}",
+            "location": "",
+            "severity": "fatal",
+            "humanized_message": "System Error: An unexpected error occurred during validation.",
+            "suppressed": False
+        }
+        
         return ValidationResponse(
             status="ERROR",
             meta=ValidationMeta(
@@ -179,10 +190,7 @@ async def validate_invoice(file: UploadFile = File(...)):
                 rules_tag="release-3.0.18",
                 commit=config["commit_hash"]
             ),
-            errors=[ValidationError(
-                id="INTERNAL_ERROR",
-                message=f"Unexpected error: {str(e)}"
-            )],
+            errors=[convert_flat_to_tiered(internal_error, session_id)],
             debug_log=None
         )
     finally:
@@ -226,20 +234,85 @@ def clean_xpath(xpath: str) -> str:
     return cleaned
 
 
-def _deduplicate_errors(errors: List[ValidationError], session_id: str) -> List[ValidationError]:
+def convert_flat_to_tiered(flat_error: dict, session_id: str) -> ValidationError:
     """
-    Deduplicate errors by grouping repeated error IDs.
-    
-    For errors with the same ID, keep the first instance and:
-    - Append "(Repeated X times)" to the message
-    - Store all XPath locations in the locations field
+    Convert flat error structure (from humanization pipeline) to tiered structure.
     
     Args:
-        errors: List of validation errors
+        flat_error: Flat error dict with keys: id, message, location, severity, humanized_message, suppressed
         session_id: Session ID for logging
         
     Returns:
-        Deduplicated list of errors
+        ValidationError with tiered structure
+    """
+    error_id = flat_error.get("id", "UNKNOWN")
+    raw_message = flat_error.get("message", "")
+    raw_location = flat_error.get("location", "")
+    severity = flat_error.get("severity", "error")
+    humanized = flat_error.get("humanized_message", raw_message)
+    suppressed = flat_error.get("suppressed", False)
+    
+    # Extract structured data if available (from R051 explainer)
+    structured_data = flat_error.get("structured_data", {})
+    bt5_value = structured_data.get("bt5_value")
+    found_currency = structured_data.get("found_currency")
+    
+    # Build evidence if we have structured data
+    evidence = None
+    if bt5_value or found_currency:
+        currency_ids = {}
+        if found_currency:
+            currency_ids[found_currency] = 1  # Will be aggregated in deduplication
+        
+        evidence = ErrorEvidence(
+            bt5_value=bt5_value,
+            currency_ids_found=currency_ids if currency_ids else None,
+            occurrence_count=1
+        )
+    
+    # Build action with default fix message
+    fix_message = "Please review and correct this error according to the Peppol BIS 3.0 specification."
+    
+    # Special fix messages for known error types
+    if error_id == "PEPPOL-EN16931-R051":
+        fix_message = "Make BT-5 (DocumentCurrencyCode) and all currencyID attributes consistent. Either change BT-5 to match the amounts, or convert amounts and update currencyID to match BT-5."
+    elif error_id == "BR-CO-15":
+        fix_message = "Verify that Tax Inclusive Amount (BT-112) = Tax Exclusive Amount (BT-109) + Tax Amount (BT-110)."
+    
+    # Create tiered error
+    return ValidationError(
+        id=error_id,
+        severity=severity,
+        action=ErrorAction(
+            summary=humanized or raw_message,
+            fix=fix_message,
+            locations=[clean_xpath(raw_location)] if raw_location else []
+        ),
+        evidence=evidence,
+        technical_details=DebugContext(
+            raw_message=raw_message,
+            raw_locations=[raw_location] if raw_location else []
+        ),
+        suppressed=suppressed
+    )
+
+
+def _deduplicate_errors(errors: List[ValidationError], session_id: str) -> List[ValidationError]:
+    """
+    Deduplicate errors by grouping repeated error IDs and aggregating evidence.
+    
+    For errors with the same ID:
+    - Aggregate all locations (cleaned and raw)
+    - Aggregate currency evidence (count occurrences)
+    - Update summary with repeat count
+    - Merge into single error
+    
+    Args:
+        errors: List of tiered validation errors
+        session_id: Session ID for logging
+        
+    Returns:
+        Deduplicated list of errors with aggregated evidence
     """
     if not errors:
         return errors
@@ -252,39 +325,73 @@ def _deduplicate_errors(errors: List[ValidationError], session_id: str) -> List[
             error_groups[error_id] = []
         error_groups[error_id].append(error)
     
-    # Build deduplicated list
+    # Build deduplicated list with aggregated evidence
     deduplicated = []
     total_before = len(errors)
     
     for error_id, group in error_groups.items():
-        if len(group) == 1:
-            # Single occurrence, no deduplication needed
-            deduplicated.append(group[0])
-        else:
-            # Multiple occurrences, deduplicate
-            first_error = group[0]
+        occurrence_count = len(group)
+        first_error = group[0]
+        
+        # Collect all unique locations (cleaned and raw)
+        cleaned_locations = []
+        raw_locations = []
+        
+        for err in group:
+            # Collect cleaned locations from action
+            for loc in err.action.locations:
+                if loc and loc not in cleaned_locations:
+                    cleaned_locations.append(loc)
             
-            # Collect all unique locations
-            all_locations = []
+            # Collect raw locations from technical_details
+            for raw_loc in err.technical_details.raw_locations:
+                if raw_loc and raw_loc not in raw_locations:
+                    raw_locations.append(raw_loc)
+        
+        # Aggregate evidence (especially for R051 currency counts)
+        aggregated_evidence = None
+        if first_error.evidence:
+            currency_counts = {}
+            bt5_value = first_error.evidence.bt5_value
+            
+            # Aggregate currency_ids_found from all instances
             for err in group:
-                if err.location and err.location not in all_locations:
-                    all_locations.append(err.location)
+                if err.evidence and err.evidence.currency_ids_found:
+                    for currency, count in err.evidence.currency_ids_found.items():
+                        currency_counts[currency] = currency_counts.get(currency, 0) + count
             
-            # Update the first error with repeat count and locations
-            repeat_count = len(group)
-            updated_message = f"{first_error.message} (Repeated {repeat_count} times)"
-            
-            deduplicated.append(ValidationError(
-                id=first_error.id,
-                message=updated_message,
-                location=first_error.location,  # Keep first location for compatibility
-                locations=all_locations,  # Store all locations
-                severity=first_error.severity,
-                humanized_message=first_error.humanized_message,
-                suppressed=first_error.suppressed
-            ))
-            
-            logger.debug(f"Session {session_id}: Deduplicated {repeat_count} instances of {error_id}")
+            aggregated_evidence = ErrorEvidence(
+                bt5_value=bt5_value,
+                currency_ids_found=currency_counts if currency_counts else first_error.evidence.currency_ids_found,
+                occurrence_count=occurrence_count
+            )
+        
+        # Update summary with repeat count if multiple occurrences
+        summary = first_error.action.summary
+        if occurrence_count > 1:
+            summary = f"{summary} (Repeated {occurrence_count} times)"
+        
+        # Create deduplicated error
+        deduplicated_error = ValidationError(
+            id=error_id,
+            severity=first_error.severity,
+            action=ErrorAction(
+                summary=summary,
+                fix=first_error.action.fix,
+                locations=cleaned_locations
+            ),
+            evidence=aggregated_evidence,
+            technical_details=DebugContext(
+                raw_message=first_error.technical_details.raw_message,
+                raw_locations=raw_locations
+            ),
+            suppressed=first_error.suppressed
+        )
+        
+        deduplicated.append(deduplicated_error)
+        
+        if occurrence_count > 1:
+            logger.debug(f"Session {session_id}: Deduplicated {occurrence_count} instances of {error_id}")
     
     total_after = len(deduplicated)
     if total_before != total_after:
@@ -322,15 +429,14 @@ def _apply_cross_error_suppression(errors: List[ValidationError], session_id: st
     for error in errors:
         if error.id == "BR-CO-15" and not error.suppressed:
             error.suppressed = True
-            # Replace humanized_message with clean, short suppression note
-            error.humanized_message = "Suppressed: Cascade error from Currency Mismatch (R051)."
-            # Also update the main message
-            suppression_note = " (Suppressed: Root cause is likely the Currency Mismatch R051)."
-            error.message = error.message + suppression_note
+            # Update action summary with clean suppression message
+            error.action.summary = "Math Error (Suppressed: Likely caused by Currency Mismatch R051)"
             suppressed_count += 1
     
     if suppressed_count > 0:
         logger.info(f"Session {session_id}: Cross-error suppression - suppressed {suppressed_count} BR-CO-15 error(s) due to R051 currency mismatch")
+    
+    return errors
     
     return errors
 
@@ -359,6 +465,17 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
         logger.info(f"Session {session_id}: Input XML is well-formed")
     except ET.ParseError as e:
         logger.warning(f"Session {session_id}: Input is not valid XML: {e}")
+        
+        # Create INVALID_XML error with tiered structure
+        invalid_xml_error = {
+            "id": "INVALID_XML",
+            "message": "Input file is not valid XML",
+            "location": "",
+            "severity": "fatal",
+            "humanized_message": "Input file is not valid XML. Please provide a well-formed XML document.",
+            "suppressed": False
+        }
+        
         return ValidationResponse(
             status="ERROR",
             meta=ValidationMeta(
@@ -366,10 +483,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                 rules_tag="release-3.0.18",
                 commit=config["commit_hash"]
             ),
-            errors=[ValidationError(
-                id="INVALID_XML",
-                message="Input file is not valid XML"
-            )],
+            errors=[convert_flat_to_tiered(invalid_xml_error, session_id)],
             debug_log=str(e)
         )
     
@@ -407,6 +521,17 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
             process.kill()
             await process.wait()
             logger.error(f"Session {session_id}: Validation timed out")
+            
+            # Create TIMEOUT error with tiered structure
+            timeout_error = {
+                "id": "TIMEOUT",
+                "message": "Validation timed out",
+                "location": "",
+                "severity": "fatal",
+                "humanized_message": "Validation timed out. The file may be too complex or contain issues.",
+                "suppressed": False
+            }
+            
             return ValidationResponse(
                 status="ERROR",
                 meta=ValidationMeta(
@@ -414,10 +539,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                     rules_tag="release-3.0.18",
                     commit=config["commit_hash"]
                 ),
-                errors=[ValidationError(
-                    id="TIMEOUT",
-                    message="Validation timed out"
-                )],
+                errors=[convert_flat_to_tiered(timeout_error, session_id)],
                 debug_log=None
             )
         
@@ -435,6 +557,17 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
             stdout_text = stdout.decode('utf-8', errors='replace')
             combined_log = f"--- STDOUT ---\n{stdout_text}\n\n--- STDERR ---\n{stderr_text}"
             logger.error(f"Session {session_id}: Validator crashed (exit code {process.returncode})")
+            
+            # Create VALIDATOR_CRASH error with tiered structure
+            crash_error = {
+                "id": "VALIDATOR_CRASH",
+                "message": "Internal validator crash",
+                "location": "",
+                "severity": "fatal",
+                "humanized_message": "System Error: The validator encountered an internal error.",
+                "suppressed": False
+            }
+            
             return ValidationResponse(
                 status="ERROR",
                 meta=ValidationMeta(
@@ -442,7 +575,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                     rules_tag="release-3.0.18",
                     commit=config["commit_hash"]
                 ),
-                errors=[ValidationError(id="VALIDATOR_CRASH", message="Internal validator crash")],
+                errors=[convert_flat_to_tiered(crash_error, session_id)],
                 debug_log=combined_log[-4000:]
             )
         # 3. If we are here, we either have a report OR returncode was 0.
@@ -452,6 +585,17 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
     
     except Exception as e:
         logger.error(f"Session {session_id}: Failed to execute validator: {e}")
+        
+        # Create EXECUTION_ERROR with tiered structure
+        execution_error = {
+            "id": "EXECUTION_ERROR",
+            "message": f"Failed to execute validator: {str(e)}",
+            "location": "",
+            "severity": "fatal",
+            "humanized_message": "System Error: Failed to execute the validation engine.",
+            "suppressed": False
+        }
+        
         return ValidationResponse(
             status="ERROR",
             meta=ValidationMeta(
@@ -459,10 +603,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                 rules_tag="release-3.0.18",
                 commit=config["commit_hash"]
             ),
-            errors=[ValidationError(
-                id="EXECUTION_ERROR",
-                message=f"Failed to execute validator: {str(e)}"
-            )],
+            errors=[convert_flat_to_tiered(execution_error, session_id)],
             debug_log=None
         )
     
@@ -500,6 +641,17 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
         logger.error(f"Session {session_id}: Report file missing")
         logger.debug(f"Session {session_id}: STDOUT: {stdout_text}")
         logger.debug(f"Session {session_id}: STDERR: {stderr_text}")
+        
+        # Create REPORT_MISSING error with tiered structure
+        report_missing_error = {
+            "id": "REPORT_MISSING",
+            "message": "Report missing",
+            "location": "",
+            "severity": "fatal",
+            "humanized_message": "System Error: The validation report could not be generated.",
+            "suppressed": False
+        }
+        
         return ValidationResponse(
             status="ERROR",
             meta=ValidationMeta(
@@ -507,10 +659,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                 rules_tag="release-3.0.18",
                 commit=config["commit_hash"]
             ),
-            errors=[ValidationError(
-                id="REPORT_MISSING",
-                message="Report missing"
-            )],
+            errors=[convert_flat_to_tiered(report_missing_error, session_id)],
             debug_log=f"STDOUT: {stdout_text}\nSTDERR: {stderr_text}"
         )
     
@@ -521,6 +670,17 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
         root = tree.getroot()
     except ET.ParseError as e:
         logger.error(f"Session {session_id}: KoSIT output malformed: {e}")
+        
+        # Create MALFORMED_REPORT error with tiered structure
+        malformed_error = {
+            "id": "MALFORMED_REPORT",
+            "message": "KoSIT output malformed",
+            "location": "",
+            "severity": "fatal",
+            "humanized_message": "System Error: The validation report could not be parsed.",
+            "suppressed": False
+        }
+        
         return ValidationResponse(
             status="ERROR",
             meta=ValidationMeta(
@@ -528,10 +688,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                 rules_tag="release-3.0.18",
                 commit=config["commit_hash"]
             ),
-            errors=[ValidationError(
-                id="MALFORMED_REPORT",
-                message="KoSIT output malformed"
-            )],
+            errors=[convert_flat_to_tiered(malformed_error, session_id)],
             debug_log=str(e)
         )
     
@@ -592,15 +749,15 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                     message = child.text.strip()
                     break
 
-        # Add to final list
-        errors.append(ValidationError(
-            id=error_code,
-            message=message,
-            location=location,
-            severity=severity,
-            humanized_message=None,
-            suppressed=False
-        ))
+        # Add to final list - using flat structure, will be converted after humanization
+        errors.append({
+            "id": error_code,
+            "message": message,
+            "location": location,
+            "severity": severity,
+            "humanized_message": None,
+            "suppressed": False
+        })
             
     # ---------------------------------------------------------
     # END NEW PARSER
@@ -619,26 +776,20 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
             kosit_errors = []
             for error in errors:
                 kosit_errors.append({
-                    "id": error.id,
-                    "message": error.message,
-                    "location": error.location or "",
-                    "severity": error.severity or "error"
+                    "id": error["id"],
+                    "message": error["message"],
+                    "location": error.get("location", ""),
+                    "severity": error.get("severity", "error")
                 })
             
             # Run humanization pipeline
             humanization_result = diagnostics_pipeline.run(kosit_errors, invoice_xml)
             
-            # Update errors with humanization results
+            # Convert humanized errors to tiered structure
             enhanced_errors = []
             for processed_error in humanization_result.processed_errors:
-                enhanced_errors.append(ValidationError(
-                    id=processed_error["id"],
-                    message=processed_error["message"],
-                    location=processed_error.get("location", ""),
-                    severity=processed_error.get("severity", "error"),
-                    humanized_message=processed_error.get("humanized_message"),
-                    suppressed=processed_error.get("suppressed", False)
-                ))
+                tiered_error = convert_flat_to_tiered(processed_error, session_id)
+                enhanced_errors.append(tiered_error)
             
             # Replace original errors with enhanced errors
             errors = enhanced_errors
@@ -688,12 +839,16 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
         stderr_text = stderr.decode('utf-8', errors='replace')
         stdout_text = stdout.decode('utf-8', errors='replace')
         
-        errors.append(ValidationError(
-            id="PARSING_MISMATCH",
-            message="The validator rejected the file, but the report could not be parsed. Check the debug log.",
-            severity="fatal",
-            humanized_message="System Error: The validator rejected this file, but we could not read the error report."
-        ))
+        # Create PARSING_MISMATCH error with tiered structure
+        parsing_error = {
+            "id": "PARSING_MISMATCH",
+            "message": "The validator rejected the file, but the report could not be parsed. Check the debug log.",
+            "location": "",
+            "severity": "fatal",
+            "humanized_message": "System Error: The validator rejected this file, but we could not read the error report.",
+            "suppressed": False
+        }
+        errors.append(convert_flat_to_tiered(parsing_error, session_id))
         
         # Attach the raw log AND XML report dump so you can debug WHY the parsing failed
         debug_output = f"""--- XML REPORT DUMP ---

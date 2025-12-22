@@ -25,6 +25,12 @@ class R051Explainer(BaseExplainer):
                     "on monetary amounts are inconsistent. Please decide which currency is correct "
                     "and make them consistent throughout the invoice."
                 )
+                # Fallback structured data when no XML tree available
+                error["structured_data"] = {
+                    "bt5_value": None,
+                    "found_currency": None,
+                    "message": error["humanized_message"]
+                }
                 return error
             
             # Try to extract the document currency code
@@ -110,18 +116,36 @@ class R051Explainer(BaseExplainer):
                     f"Currency Conflict. The Document Currency is '{document_currency}', "
                     f"but this field uses '{found_currency}'. Please make them consistent."
                 )
+                # Add structured data for tiered error model
+                error["structured_data"] = {
+                    "bt5_value": document_currency,
+                    "found_currency": found_currency,
+                    "message": error["humanized_message"]
+                }
             elif document_currency:
                 error["humanized_message"] = (
                     f"Currency Conflict. The Document Currency Code (BT-5) is '{document_currency}', "
                     "but amounts use a different currencyID. Please decide which currency is correct "
                     "and make them consistent (either update BT-5, or update the currencyID on all amounts)."
                 )
+                # Partial structured data (no found_currency)
+                error["structured_data"] = {
+                    "bt5_value": document_currency,
+                    "found_currency": None,
+                    "message": error["humanized_message"]
+                }
             else:
                 error["humanized_message"] = (
                     "Currency Conflict. The Document Currency Code (BT-5) and the currencyID attributes "
                     "on monetary amounts are inconsistent. Please decide which currency is correct "
                     "and make them consistent throughout the invoice."
                 )
+                # No specific currency data available
+                error["structured_data"] = {
+                    "bt5_value": None,
+                    "found_currency": None,
+                    "message": error["humanized_message"]
+                }
                 
         except Exception as e:
             logger.warning(f"Failed to enrich R051 error: {e}")
@@ -129,5 +153,11 @@ class R051Explainer(BaseExplainer):
                 "Currency Conflict. The Document Currency Code (BT-5) and currencyID attributes "
                 "on amounts are inconsistent. Please make them consistent."
             )
+            # Fallback structured data
+            error["structured_data"] = {
+                "bt5_value": None,
+                "found_currency": None,
+                "message": error["humanized_message"]
+            }
         
         return error
