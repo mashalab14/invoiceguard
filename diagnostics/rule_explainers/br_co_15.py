@@ -13,8 +13,8 @@ class BrCo15Explainer(BaseExplainer):
         """
         Enrich BR-CO-15 error with specific evidence from the XML.
         
-        This rule typically checks that the invoice total matches 
-        the sum of line amounts plus taxes.
+        This rule checks that Tax Inclusive Amount (BT-112) = Tax Exclusive Amount (BT-109) + Tax Amount (BT-110).
+        Also detects currency code mismatches which can cause correct math to be rejected.
         """
         try:
             xml_tree = context.xml_tree
@@ -22,8 +22,8 @@ class BrCo15Explainer(BaseExplainer):
             
             if not xml_tree:
                 error["humanized_message"] = (
-                    "Invoice total calculation error. Please verify that the total payable "
-                    "amount matches the sum of line amounts and applicable taxes."
+                    "Invoice total calculation error. Please verify that the Tax Inclusive Amount (BT-112) "
+                    "matches the sum of Tax Exclusive Amount (BT-109) and Tax Amount (BT-110)."
                 )
                 return error
             
@@ -31,30 +31,45 @@ class BrCo15Explainer(BaseExplainer):
             evidence = self._extract_monetary_evidence(xml_tree, namespaces)
             
             if evidence['extraction_successful']:
+                # Check if math is correct but currency mismatch might be the issue
+                math_correct = self._check_arithmetic(
+                    evidence.get('tax_exclusive'),
+                    evidence.get('tax_amount'),
+                    evidence.get('payable')
+                )
+                
                 # Build specific explanation with extracted values
                 explanation_parts = ["Invoice total calculation error."]
                 
-                if evidence['tax_exclusive'] and evidence['payable']:
+                if math_correct:
+                    # Math is correct, likely a currency mismatch issue
                     explanation_parts.append(
-                        f"The payable amount does not match the sum of tax exclusive amount plus tax amount."
+                        f"The calculation appears correct ({evidence['tax_exclusive']} + {evidence['tax_amount'] or '0'} = {evidence['payable']}), "
+                        "but the validator rejected it. This is often caused by Currency Code mismatches between "
+                        "the Document Currency Code (BT-5) and the currencyID attributes on amount fields. "
+                        "Check for other currency-related errors (e.g., PEPPOL-EN16931-R051)."
+                    )
+                elif evidence['tax_exclusive'] and evidence['payable']:
+                    explanation_parts.append(
+                        f"The Tax Inclusive Amount (BT-112) does not match the sum of Tax Exclusive Amount (BT-109) plus Tax Amount (BT-110)."
                     )
                     
                     details = []
                     if evidence['tax_exclusive']:
-                        details.append(f"Tax Exclusive Amount: {evidence['tax_exclusive']}")
+                        details.append(f"Tax Exclusive Amount (BT-109): {evidence['tax_exclusive']}")
                     if evidence['tax_amount']:
-                        details.append(f"Tax Amount: {evidence['tax_amount']}")
+                        details.append(f"Tax Amount (BT-110): {evidence['tax_amount']}")
                     else:
-                        details.append("Tax Amount: (not found or zero)")
+                        details.append("Tax Amount (BT-110): (not found or zero)")
                     if evidence['payable']:
-                        details.append(f"Payable Amount: {evidence['payable']}")
+                        details.append(f"Tax Inclusive Amount (BT-112): {evidence['payable']}")
                     
                     explanation_parts.append(f"Found: {', '.join(details)}.")
                     explanation_parts.append("Please verify the arithmetic calculation of the invoice totals.")
                 else:
                     explanation_parts.append(
                         "Could not extract all required amounts for detailed analysis. "
-                        "Please verify that payable amount = tax exclusive amount + tax amount."
+                        "Please verify that Tax Inclusive Amount (BT-112) = Tax Exclusive Amount (BT-109) + Tax Amount (BT-110)."
                     )
                 
                 error["humanized_message"] = " ".join(explanation_parts)
@@ -62,18 +77,47 @@ class BrCo15Explainer(BaseExplainer):
                 # Fallback when extraction fails completely
                 error["humanized_message"] = (
                     "Invoice total calculation error. Could not extract monetary amounts "
-                    "from the invoice XML. Please verify that the payable amount equals "
-                    "the tax exclusive amount plus tax amount according to BR-CO-15."
+                    "from the invoice XML. Please verify that the Tax Inclusive Amount (BT-112) equals "
+                    "the Tax Exclusive Amount (BT-109) plus Tax Amount (BT-110) according to BR-CO-15."
                 )
                 
         except Exception as e:
             logger.warning(f"Failed to enrich BR-CO-15 error: {e}")
             error["humanized_message"] = (
-                "Invoice total calculation error. Please verify that the total payable "
-                "amount matches the sum of line amounts and applicable taxes."
+                "Invoice total calculation error. Please verify that the Tax Inclusive Amount (BT-112) "
+                "matches the sum of Tax Exclusive Amount (BT-109) and Tax Amount (BT-110)."
             )
         
         return error
+    
+    def _check_arithmetic(self, tax_exclusive: str, tax_amount: str, payable: str) -> bool:
+        """
+        Check if the arithmetic is correct (allowing for rounding tolerance).
+        
+        Args:
+            tax_exclusive: Tax exclusive amount as string
+            tax_amount: Tax amount as string (can be None)
+            payable: Payable amount as string
+            
+        Returns:
+            True if math is correct within tolerance, False otherwise
+        """
+        try:
+            if not tax_exclusive or not payable:
+                return False
+            
+            exclusive = float(tax_exclusive)
+            tax = float(tax_amount) if tax_amount else 0.0
+            pay = float(payable)
+            
+            calculated = exclusive + tax
+            
+            # Allow for small rounding differences (0.01 tolerance)
+            tolerance = 0.01
+            return abs(calculated - pay) <= tolerance
+            
+        except (ValueError, TypeError):
+            return False
     
     def _extract_monetary_evidence(self, xml_tree, namespaces: dict) -> dict:
         """

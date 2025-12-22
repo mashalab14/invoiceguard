@@ -3,6 +3,7 @@ from diagnostics.rule_explainers.base import BaseExplainer
 from diagnostics.rule_explainers.br_co_15 import BrCo15Explainer
 from diagnostics.rule_explainers.br_co_16 import BrCo16Explainer
 from diagnostics.rule_explainers.peppol_r001 import PeppolR001Explainer
+from diagnostics.rule_explainers.r051 import R051Explainer
 from diagnostics.rule_explainers.ubl_cr_001 import UblCr001Explainer
 import logging
 
@@ -19,6 +20,7 @@ class ExplainerFactory:
         "BR-CO-15": BrCo15Explainer(),
         "BR-CO-16": BrCo16Explainer(),
         "PEPPOL-EN16931-R001": PeppolR001Explainer(),
+        "PEPPOL-EN16931-R051": R051Explainer(),
         "UBL-CR-001": UblCr001Explainer(),
         # Add more explainers here as they are implemented
     }

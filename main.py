@@ -43,9 +43,10 @@ app = FastAPI(title="InvoiceGuard", version="1.0.0")
 
 
 class ValidationError(BaseModel):
-    code: str
+    id: str  # Renamed from 'code' to match pipeline expectations
     message: str
     location: Optional[str] = None
+    locations: Optional[List[str]] = None  # For storing multiple XPath locations when deduplicated
     severity: Optional[str] = None
     humanized_message: Optional[str] = None
     suppressed: Optional[bool] = None
@@ -188,7 +189,7 @@ async def validate_invoice(file: UploadFile = File(...)):
                 commit=config["commit_hash"]
             ),
             errors=[ValidationError(
-                code="INTERNAL_ERROR",
+                id="INTERNAL_ERROR",
                 message=f"Unexpected error: {str(e)}"
             )],
             debug_log=None
@@ -201,6 +202,73 @@ async def validate_invoice(file: UploadFile = File(...)):
                 logger.debug(f"Session {session_id}: Cleaned up temp directory")
             except Exception as e:
                 logger.error(f"Session {session_id}: Failed to cleanup: {e}")
+
+
+def _deduplicate_errors(errors: List[ValidationError], session_id: str) -> List[ValidationError]:
+    """
+    Deduplicate errors by grouping repeated error IDs.
+    
+    For errors with the same ID, keep the first instance and:
+    - Append "(Repeated X times)" to the message
+    - Store all XPath locations in the locations field
+    
+    Args:
+        errors: List of validation errors
+        session_id: Session ID for logging
+        
+    Returns:
+        Deduplicated list of errors
+    """
+    if not errors:
+        return errors
+    
+    # Group errors by ID
+    error_groups = {}
+    for error in errors:
+        error_id = error.id
+        if error_id not in error_groups:
+            error_groups[error_id] = []
+        error_groups[error_id].append(error)
+    
+    # Build deduplicated list
+    deduplicated = []
+    total_before = len(errors)
+    
+    for error_id, group in error_groups.items():
+        if len(group) == 1:
+            # Single occurrence, no deduplication needed
+            deduplicated.append(group[0])
+        else:
+            # Multiple occurrences, deduplicate
+            first_error = group[0]
+            
+            # Collect all unique locations
+            all_locations = []
+            for err in group:
+                if err.location and err.location not in all_locations:
+                    all_locations.append(err.location)
+            
+            # Update the first error with repeat count and locations
+            repeat_count = len(group)
+            updated_message = f"{first_error.message} (Repeated {repeat_count} times)"
+            
+            deduplicated.append(ValidationError(
+                id=first_error.id,
+                message=updated_message,
+                location=first_error.location,  # Keep first location for compatibility
+                locations=all_locations,  # Store all locations
+                severity=first_error.severity,
+                humanized_message=first_error.humanized_message,
+                suppressed=first_error.suppressed
+            ))
+            
+            logger.debug(f"Session {session_id}: Deduplicated {repeat_count} instances of {error_id}")
+    
+    total_after = len(deduplicated)
+    if total_before != total_after:
+        logger.info(f"Session {session_id}: Deduplication reduced errors from {total_before} to {total_after}")
+    
+    return deduplicated
 
 
 async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
@@ -235,7 +303,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                 commit=config["commit_hash"]
             ),
             errors=[ValidationError(
-                code="INVALID_XML",
+                id="INVALID_XML",
                 message="Input file is not valid XML"
             )],
             debug_log=str(e)
@@ -283,7 +351,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                     commit=config["commit_hash"]
                 ),
                 errors=[ValidationError(
-                    code="TIMEOUT",
+                    id="TIMEOUT",
                     message="Validation timed out"
                 )],
                 debug_log=None
@@ -310,7 +378,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                     rules_tag="release-3.0.18",
                     commit=config["commit_hash"]
                 ),
-                errors=[ValidationError(code="VALIDATOR_CRASH", message="Internal validator crash")],
+                errors=[ValidationError(id="VALIDATOR_CRASH", message="Internal validator crash")],
                 debug_log=combined_log[-4000:]
             )
         # 3. If we are here, we either have a report OR returncode was 0.
@@ -328,7 +396,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                 commit=config["commit_hash"]
             ),
             errors=[ValidationError(
-                code="EXECUTION_ERROR",
+                id="EXECUTION_ERROR",
                 message=f"Failed to execute validator: {str(e)}"
             )],
             debug_log=None
@@ -376,7 +444,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                 commit=config["commit_hash"]
             ),
             errors=[ValidationError(
-                code="REPORT_MISSING",
+                id="REPORT_MISSING",
                 message="Report missing"
             )],
             debug_log=f"STDOUT: {stdout_text}\nSTDERR: {stderr_text}"
@@ -397,7 +465,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                 commit=config["commit_hash"]
             ),
             errors=[ValidationError(
-                code="MALFORMED_REPORT",
+                id="MALFORMED_REPORT",
                 message="KoSIT output malformed"
             )],
             debug_log=str(e)
@@ -462,7 +530,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
 
         # Add to final list
         errors.append(ValidationError(
-            code=error_code,
+            id=error_code,
             message=message,
             location=location,
             severity=severity,
@@ -487,7 +555,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
             kosit_errors = []
             for error in errors:
                 kosit_errors.append({
-                    "id": error.code,
+                    "id": error.id,
                     "message": error.message,
                     "location": error.location or "",
                     "severity": error.severity or "error"
@@ -500,7 +568,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
             enhanced_errors = []
             for processed_error in humanization_result.processed_errors:
                 enhanced_errors.append(ValidationError(
-                    code=processed_error["id"],
+                    id=processed_error["id"],
                     message=processed_error["message"],
                     location=processed_error.get("location", ""),
                     severity=processed_error.get("severity", "error"),
@@ -516,11 +584,14 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
             suppressed_count = sum(1 for e in errors if e.suppressed)
             logger.info(f"Session {session_id}: Humanization completed - {enriched_count} enriched, {suppressed_count} suppressed")
             
+            # Deduplicate errors - group repeated errors by ID
+            errors = _deduplicate_errors(errors, session_id)
+            
         except Exception as e:
             logger.error(f"Session {session_id}: Humanization failed: {e}")
             # Continue with original errors if humanization fails
     
-# Determine status
+    # Determine status
     if errors:
         validation_status = "REJECTED"
         logger.info(f"Session {session_id}: Validation REJECTED ({len(errors)} error(s))")
@@ -551,7 +622,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
         stdout_text = stdout.decode('utf-8', errors='replace')
         
         errors.append(ValidationError(
-            code="PARSING_MISMATCH",
+            id="PARSING_MISMATCH",
             message="The validator rejected the file, but the report could not be parsed. Check the debug log.",
             severity="fatal",
             humanized_message="System Error: The validator rejected this file, but we could not read the error report."
