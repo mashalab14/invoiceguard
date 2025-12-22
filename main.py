@@ -403,52 +403,76 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
             debug_log=str(e)
         )
     
-    # Extract validation errors (namespace-agnostic)
+    # ---------------------------------------------------------
+    # NEW: Dual-Mode Parser (KoSIT VARL + Standard SVRL)
+    # ---------------------------------------------------------
     errors = []
-    failed_asserts = []
+    
+    # We iterate every node. We strip namespaces.
+    # We look for BOTH 'message' (KoSIT format) and 'failed-assert' (Standard format)
+    
+    failed_items = []
+    
     for elem in root.iter():
-        if elem.tag.split('}')[-1] == 'failed-assert':
-            failed_asserts.append(elem)
+        tag_name = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+        
+        # Mode 1: KoSIT VARL Format (What is in your logs)
+        # Structure: <rep:message code="BR-CO-15" level="error">Text</rep:message>
+        if tag_name == 'message':
+            error_code = elem.get('code')
+            if error_code: # Only treat as error if it has a code
+                failed_items.append({
+                    'type': 'kosit',
+                    'elem': elem
+                })
 
-    for failed_assert in failed_asserts:
-        # Extract error code (id attribute or location attribute or UNKNOWN)
-        error_code = failed_assert.get('id')
-        if not error_code:
-            error_code = failed_assert.get('location')
-        if not error_code:
-            error_code = "UNKNOWN"
+        # Mode 2: Standard SVRL Format (Fallback)
+        # Structure: <svrl:failed-assert id="BR-CO-15"><svrl:text>Text</svrl:text>...
+        elif tag_name == 'failed-assert':
+             failed_items.append({
+                'type': 'svrl',
+                'elem': elem
+             })
 
-        # Extract message (text child element, namespace-agnostic)
-        message = "Validation failed"
-        for child in failed_assert:
-            if child.tag.split('}')[-1] == 'text' and child.text:
-                message = child.text
-                break
+    logger.debug(f"Session {session_id}: Found {len(failed_items)} raw error items")
 
-        # Extract location (location attribute)
-        location = failed_assert.get('location', '')
+    for item in failed_items:
+        elem = item['elem']
+        
+        if item['type'] == 'kosit':
+            # --- PARSING KOSIT VARL ---
+            error_code = elem.get('code', 'UNKNOWN')
+            severity = elem.get('level', 'error')
+            location = elem.get('xpathLocation', '')
+            message = elem.text.strip() if elem.text else "Validation failed"
+            
+        else:
+            # --- PARSING STANDARD SVRL ---
+            error_code = elem.get('id') or elem.get('location') or "UNKNOWN"
+            severity = "error" # SVRL failed-assert is always an error
+            location = elem.get('location', '')
+            
+            # Find message text in children
+            message = "Validation failed"
+            for child in elem:
+                child_tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                if child_tag == 'text' and child.text:
+                    message = child.text.strip()
+                    break
 
+        # Add to final list
         errors.append(ValidationError(
             code=error_code,
-            message=message.strip(),
+            message=message,
             location=location,
-            severity="error",
+            severity=severity,
             humanized_message=None,
             suppressed=False
         ))
-
-    # Proof of execution check (namespace-agnostic)
-    if len(failed_asserts) == 0:
-        active_patterns = []
-        fired_rules = []
-        for elem in root.iter():
-            tag = elem.tag.split('}')[-1]
-            if tag == 'active-pattern':
-                active_patterns.append(elem)
-            elif tag == 'fired-rule':
-                fired_rules.append(elem)
-        if not active_patterns and not fired_rules:
-            logger.warning(f"Session {session_id}: No failed-assert and no execution proof found")
+            
+    # ---------------------------------------------------------
+    # END NEW PARSER
+    # ---------------------------------------------------------
     
     # Apply humanization layer to enhance error messages
     if errors:
