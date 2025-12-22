@@ -300,11 +300,11 @@ def _apply_cross_error_suppression(errors: List[ValidationError], session_id: st
     for error in errors:
         if error.id == "BR-CO-15" and not error.suppressed:
             error.suppressed = True
-            # Append suppression reason to both message and humanized_message
+            # Replace humanized_message with clean, short suppression note
+            error.humanized_message = "Suppressed: Cascade error from Currency Mismatch (R051)."
+            # Also update the main message
             suppression_note = " (Suppressed: Root cause is likely the Currency Mismatch R051)."
             error.message = error.message + suppression_note
-            if error.humanized_message:
-                error.humanized_message = error.humanized_message + suppression_note
             suppressed_count += 1
     
     if suppressed_count > 0:
@@ -699,6 +699,15 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
     else:
         validation_status = "PASSED"
         logger.info(f"Session {session_id}: Validation PASSED")
+    
+    # Sort errors: active errors first, suppressed errors last
+    if errors:
+        active_errors = [e for e in errors if not e.suppressed]
+        suppressed_errors = [e for e in errors if e.suppressed]
+        errors = active_errors + suppressed_errors
+        
+        if suppressed_errors:
+            logger.debug(f"Session {session_id}: Sorted {len(active_errors)} active errors before {len(suppressed_errors)} suppressed errors")
     
     return ValidationResponse(
         status=validation_status,
