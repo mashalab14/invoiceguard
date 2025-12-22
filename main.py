@@ -403,22 +403,13 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
             debug_log=str(e)
         )
     
-    # Extract validation errors
+    # Extract validation errors (namespace-agnostic)
     errors = []
-    
-    # Define namespace (Schematron typically uses svrl namespace)
-    namespaces = {
-        'svrl': 'http://purl.oclc.org/dsdl/svrl',
-        'xsl': 'http://www.w3.org/1999/XSL/Transform'
-    }
-    
-    # Find all failed-assert elements
-    failed_asserts = root.findall('.//svrl:failed-assert', namespaces)
-    
-    # Also try without namespace if not found
-    if not failed_asserts:
-        failed_asserts = root.findall('.//failed-assert')
-    
+    failed_asserts = []
+    for elem in root.iter():
+        if elem.tag.split('}')[-1] == 'failed-assert':
+            failed_asserts.append(elem)
+
     for failed_assert in failed_asserts:
         # Extract error code (id attribute or location attribute or UNKNOWN)
         error_code = failed_assert.get('id')
@@ -426,17 +417,17 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
             error_code = failed_assert.get('location')
         if not error_code:
             error_code = "UNKNOWN"
-        
-        # Extract message (text element)
-        text_elem = failed_assert.find('svrl:text', namespaces)
-        if text_elem is None:
-            text_elem = failed_assert.find('text')
-        
-        message = text_elem.text if text_elem is not None and text_elem.text else "Validation failed"
-        
+
+        # Extract message (text child element, namespace-agnostic)
+        message = "Validation failed"
+        for child in failed_assert:
+            if child.tag.split('}')[-1] == 'text' and child.text:
+                message = child.text
+                break
+
         # Extract location (location attribute)
         location = failed_assert.get('location', '')
-        
+
         errors.append(ValidationError(
             code=error_code,
             message=message.strip(),
@@ -445,18 +436,17 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
             humanized_message=None,
             suppressed=False
         ))
-    
-    # Proof of execution check
+
+    # Proof of execution check (namespace-agnostic)
     if len(failed_asserts) == 0:
-        # Check for active-pattern or fired-rule elements as proof of execution
-        active_patterns = root.findall('.//svrl:active-pattern', namespaces)
-        fired_rules = root.findall('.//svrl:fired-rule', namespaces)
-        
-        if not active_patterns:
-            active_patterns = root.findall('.//active-pattern')
-        if not fired_rules:
-            fired_rules = root.findall('.//fired-rule')
-        
+        active_patterns = []
+        fired_rules = []
+        for elem in root.iter():
+            tag = elem.tag.split('}')[-1]
+            if tag == 'active-pattern':
+                active_patterns.append(elem)
+            elif tag == 'fired-rule':
+                fired_rules.append(elem)
         if not active_patterns and not fired_rules:
             logger.warning(f"Session {session_id}: No failed-assert and no execution proof found")
     
