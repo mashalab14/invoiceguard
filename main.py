@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 # Enhanced imports
 from diagnostics.pipeline import DiagnosticsPipeline
+from diagnostics.models import ValidationError, ErrorAction, ErrorEvidence, DebugContext
 
 # Configure logging
 logging.basicConfig(
@@ -40,16 +41,6 @@ validation_semaphore = asyncio.Semaphore(1)
 
 # Application
 app = FastAPI(title="InvoiceGuard", version="1.0.0")
-
-
-class ValidationError(BaseModel):
-    id: str  # Renamed from 'code' to match pipeline expectations
-    message: str
-    location: Optional[str] = None
-    locations: Optional[List[str]] = None  # For storing multiple XPath locations when deduplicated
-    severity: Optional[str] = None
-    humanized_message: Optional[str] = None
-    suppressed: Optional[bool] = None
 
 
 class ValidationMeta(BaseModel):
@@ -202,6 +193,37 @@ async def validate_invoice(file: UploadFile = File(...)):
                 logger.debug(f"Session {session_id}: Cleaned up temp directory")
             except Exception as e:
                 logger.error(f"Session {session_id}: Failed to cleanup: {e}")
+
+
+def clean_xpath(xpath: str) -> str:
+    """
+    Clean XPath by removing namespace prefixes and making it human-readable.
+    
+    Examples:
+        /*:Invoice[namespace-uri()='...'] → /Invoice[1]
+        /cbc:TaxExclusiveAmount[1] → /TaxExclusiveAmount[1]
+    
+    Args:
+        xpath: Raw XPath with namespaces
+        
+    Returns:
+        Clean XPath without namespace prefixes
+    """
+    if not xpath:
+        return xpath
+    
+    import re
+    
+    # Remove namespace-uri() predicates
+    cleaned = re.sub(r'\[namespace-uri\(\)=[^\]]+\]', '', xpath)
+    
+    # Remove *: namespace prefixes
+    cleaned = re.sub(r'/\*:', '/', cleaned)
+    
+    # Remove cbc:, cac:, and other namespace prefixes
+    cleaned = re.sub(r'/(cbc|cac|ubl|qdt|ccts):', '/', cleaned)
+    
+    return cleaned
 
 
 def _deduplicate_errors(errors: List[ValidationError], session_id: str) -> List[ValidationError]:
