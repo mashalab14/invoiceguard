@@ -1,15 +1,26 @@
 """
 Data models for validation errors with tiered information structure.
+
+Core "Brain" models - always produce full data-rich objects.
+Presentation filtering is applied separately based on OutputMode.
 """
 from typing import List, Optional, Dict
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from enum import Enum
+
+
+class OutputMode(str, Enum):
+    """Output filtering modes for different user personas."""
+    SHORT = "short"        # Supplier: Only id, summary, fix
+    BALANCED = "balanced"  # Developer: Add evidence, 3 sample locations, show suppressed
+    DETAILED = "detailed"  # Auditor: Everything (all locations, raw logs)
 
 
 class ErrorAction(BaseModel):
     """User-facing action guidance."""
     summary: str  # Brief description of the error
     fix: str  # Step-by-step fix instructions
-    locations: List[str]  # Human-readable XPaths (cleaned, no namespaces)
+    locations: List[str] = Field(default_factory=list)  # Human-readable XPaths (cleaned, no namespaces)
 
 
 class ErrorEvidence(BaseModel):
@@ -28,6 +39,8 @@ class DebugContext(BaseModel):
 class ValidationError(BaseModel):
     """
     Validation error with tiered information structure.
+    
+    Core "Brain" model - always complete and data-rich.
     
     Structure:
     - action: User-facing guidance (what to do)

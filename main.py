@@ -19,7 +19,8 @@ from pydantic import BaseModel
 
 # Enhanced imports
 from diagnostics.pipeline import DiagnosticsPipeline
-from diagnostics.models import ValidationError, ErrorAction, ErrorEvidence, DebugContext
+from diagnostics.models import ValidationError, ErrorAction, ErrorEvidence, DebugContext, OutputMode
+from diagnostics.presentation import apply_mode_filter
 
 # Configure logging
 logging.basicConfig(
@@ -125,13 +126,60 @@ async def root():
     }
 
 
-@app.post("/validate", response_model=ValidationResponse)
-async def validate_invoice(file: UploadFile = File(...)):
+def _apply_presentation_filter(response: ValidationResponse, mode: OutputMode) -> Dict:
+    """
+    Apply presentation layer filtering to ValidationResponse based on mode.
+    
+    This is the final transformation before JSON response.
+    Architecture: Brain (validation) → Presentation (filtering) → JSON
+    
+    Args:
+        response: Complete ValidationResponse from "Brain"
+        mode: Output filtering mode
+        
+    Returns:
+        Dict suitable for JSONResponse with filtered errors
+    """
+    # Apply mode filter to errors list
+    filtered_result = apply_mode_filter(response.errors, mode)
+    
+    # Build response dict
+    result = {
+        "status": response.status,
+        "meta": {
+            "engine": response.meta.engine,
+            "rules_tag": response.meta.rules_tag,
+            "commit": response.meta.commit
+        }
+    }
+    
+    # Add filtered errors (renamed from 'errors' to match new structure)
+    result.update(filtered_result)
+    
+    # Include debug_log if present (only in DETAILED mode or if explicitly set)
+    if mode == OutputMode.DETAILED and response.debug_log:
+        result["debug_log"] = response.debug_log
+    
+    return result
+
+
+@app.post("/validate")
+async def validate_invoice(
+    file: UploadFile = File(...),
+    mode: OutputMode = OutputMode.BALANCED
+):
     """
     Validate a Peppol BIS 3.0 invoice against KoSIT rules.
     
+    Args:
+        file: Invoice XML file to validate
+        mode: Output filtering mode (SHORT, BALANCED, DETAILED)
+              - SHORT: Only id, summary, fix (for Suppliers)
+              - BALANCED: Add evidence, 3 sample locations (for Developers) [default]
+              - DETAILED: Everything including all locations and raw logs (for Auditors)
+    
     Returns:
-        ValidationResponse with status PASSED, REJECTED, or ERROR
+        JSONResponse with validation results filtered by mode
     """
     session_id = str(uuid.uuid4())
     session_dir = os.path.join(TEMP_DIR, session_id)
@@ -165,8 +213,9 @@ async def validate_invoice(file: UploadFile = File(...)):
         
         # Acquire semaphore for validation
         async with validation_semaphore:
-            result = await validate_file(session_id, input_path)
-            return result
+            result = await validate_file(session_id, input_path, mode)
+            filtered_result = _apply_presentation_filter(result, mode)
+            return JSONResponse(content=filtered_result)
     
     except HTTPException:
         raise
@@ -183,7 +232,7 @@ async def validate_invoice(file: UploadFile = File(...)):
             "suppressed": False
         }
         
-        return ValidationResponse(
+        error_response = ValidationResponse(
             status="ERROR",
             meta=ValidationMeta(
                 engine="KoSIT 1.5.0",
@@ -193,6 +242,8 @@ async def validate_invoice(file: UploadFile = File(...)):
             errors=[convert_flat_to_tiered(internal_error, session_id)],
             debug_log=None
         )
+        filtered_error = _apply_presentation_filter(error_response, mode)
+        return JSONResponse(content=filtered_error)
     finally:
         # Always cleanup temp directory
         if os.path.exists(session_dir):
@@ -437,20 +488,19 @@ def _apply_cross_error_suppression(errors: List[ValidationError], session_id: st
         logger.info(f"Session {session_id}: Cross-error suppression - suppressed {suppressed_count} BR-CO-15 error(s) due to R051 currency mismatch")
     
     return errors
-    
-    return errors
 
 
-async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
+async def validate_file(session_id: str, input_path: str, mode: OutputMode = OutputMode.BALANCED) -> ValidationResponse:
     """
     Execute validation logic for a single file.
     
     Args:
         session_id: Unique session identifier
         input_path: Path to input XML file
+        mode: Output filtering mode (SHORT, BALANCED, DETAILED)
         
     Returns:
-        ValidationResponse with results
+        ValidationResponse with results filtered by mode
     """
     session_dir = os.path.dirname(input_path)
     output_dir = os.path.join(session_dir, "output")
