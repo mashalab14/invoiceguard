@@ -508,8 +508,23 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
         validation_status = "ERROR"
         logger.error(f"Session {session_id}: Validator exited with error code {process.returncode} but no SVRL errors were parsed.")
         
+        # DEBUG TRAP: Read the XML report content to see what's inside
+        report_dump = ""
+        if report_path and os.path.exists(report_path):
+            try:
+                with open(report_path, 'r', encoding='utf-8') as f:
+                    report_dump = f.read()
+                logger.debug(f"Session {session_id}: Successfully read report file ({len(report_dump)} bytes)")
+            except Exception as e:
+                report_dump = f"[ERROR: Could not read report file: {e}]"
+                logger.error(f"Session {session_id}: Failed to read report file: {e}")
+        else:
+            report_dump = f"[ERROR: Report file not found at path: {report_path}]"
+            logger.error(f"Session {session_id}: Report file not found at {report_path}")
+        
         # Capture the stderr to show what went wrong
         stderr_text = stderr.decode('utf-8', errors='replace')
+        stdout_text = stdout.decode('utf-8', errors='replace')
         
         errors.append(ValidationError(
             code="PARSING_MISMATCH",
@@ -518,7 +533,17 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
             humanized_message="System Error: The validator rejected this file, but we could not read the error report."
         ))
         
-        # Attach the raw log so you can debug WHY the parsing failed
+        # Attach the raw log AND XML report dump so you can debug WHY the parsing failed
+        debug_output = f"""--- XML REPORT DUMP ---
+{report_dump}
+
+--- STDOUT ---
+{stdout_text}
+
+--- STDERR ---
+{stderr_text}
+"""
+        
         return ValidationResponse(
             status="ERROR",
             meta=ValidationMeta(
@@ -527,7 +552,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                 commit=config["commit_hash"]
             ),
             errors=errors,
-            debug_log=f"STDOUT:\n{stdout.decode('utf-8', errors='replace')}\n\nSTDERR:\n{stderr_text}"
+            debug_log=debug_output
         )
     # --- SAFETY CATCH END ---
 
