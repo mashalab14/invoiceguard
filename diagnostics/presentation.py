@@ -4,8 +4,12 @@ Presentation layer for filtering validation responses based on output mode.
 This module implements the "Presentation" side of the Brain-Presentation architecture.
 The Brain (deduplication, suppression) always produces full data-rich objects.
 This layer applies final transformations based on user persona (SHORT, BALANCED, DETAILED).
+
+Aggregation: SHORT and BALANCED group repeated error instances by (id, summary, fix)
+to produce one diagnosis entry per underlying issue with count and location sampling.
 """
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Tuple
+from collections import defaultdict
 import logging
 
 logger = logging.getLogger(__name__)
@@ -67,28 +71,135 @@ def _remove_technical_keys(data: Any) -> Any:
         return data
 
 
-def _filter_short(errors: List[Any]) -> List[Dict[str, Any]]:
+def _truncate_string(text: str, max_length: int) -> str:
     """
-    Filter errors for SHORT mode - only id, summary, fix.
+    Truncate string to max_length, adding ellipsis if truncated.
+    
+    Args:
+        text: String to truncate
+        max_length: Maximum length (including ellipsis)
+        
+    Returns:
+        Truncated string with '...' appended if shortened
+    """
+    if not text or len(text) <= max_length:
+        return text
+    return text[:max_length - 3] + "..."
+
+
+def _group_errors(errors: List[Any]) -> Dict[Tuple[str, str, str], List[Any]]:
+    """
+    Group errors by (id, summary, fix) to identify repeated issues.
     
     Args:
         errors: List of ValidationError objects
         
     Returns:
-        List of minimal dicts with whitelist fields only
+        Dictionary mapping (id, summary, fix) tuple to list of error instances
     """
-    filtered = []
+    groups = defaultdict(list)
     for error in errors:
-        # Skip suppressed errors
         if error.suppressed:
             continue
-            
-        # Build dict with only allowed fields
+        key = (error.id, error.action.summary, error.action.fix)
+        groups[key].append(error)
+    return groups
+
+
+def _aggregate_locations(errors: List[Any]) -> List[str]:
+    """
+    Aggregate locations from multiple error instances, returning first 3.
+    
+    Args:
+        errors: List of error instances with same underlying issue
+        
+    Returns:
+        List of up to 3 location strings
+    """
+    locations = []
+    for error in errors:
+        if error.action.locations:
+            locations.extend(error.action.locations)
+    return locations[:3]
+
+
+def _aggregate_evidence(errors: List[Any]) -> Dict[str, Any]:
+    """
+    Merge evidence from multiple error instances conservatively.
+    Only includes fields that appear in all instances.
+    
+    Args:
+        errors: List of error instances with same underlying issue
+        
+    Returns:
+        Merged evidence dictionary
+    """
+    if not errors:
+        return {}
+    
+    # Collect all evidence dicts
+    evidence_dicts = []
+    for error in errors:
+        if error.evidence:
+            evidence_dict = error.evidence.model_dump(exclude_none=True, exclude_unset=True)
+            if evidence_dict:
+                evidence_dicts.append(evidence_dict)
+    
+    if not evidence_dicts:
+        return {}
+    
+    # Start with first evidence as base
+    merged = evidence_dicts[0].copy()
+    
+    # For lists/arrays, merge by collecting unique values
+    for key in list(merged.keys()):
+        if isinstance(merged[key], list):
+            all_values = []
+            for ev in evidence_dicts:
+                if key in ev and isinstance(ev[key], list):
+                    all_values.extend(ev[key])
+            # Keep unique values, preserve order
+            merged[key] = list(dict.fromkeys(all_values))
+    
+    return merged
+
+
+def _filter_short(errors: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Filter errors for SHORT mode with aggressive aggregation.
+    Groups by (id, summary, fix) and truncates strings.
+    
+    Output per group:
+    - id: Error identifier
+    - title: Truncated summary (≤100 chars)
+    - fix: Truncated fix (≤140 chars)
+    - count: Number of merged instances
+    - locations_sample: First 3 locations (optional)
+    
+    Args:
+        errors: List of ValidationError objects
+        
+    Returns:
+        List of minimal dicts with aggregated data
+    """
+    # Group errors by (id, summary, fix)
+    groups = _group_errors(errors)
+    
+    filtered = []
+    for (error_id, summary, fix), error_instances in groups.items():
+        # Build aggregated item
         item = {
-            "id": error.id,
-            "summary": error.action.summary,
-            "fix": error.action.fix
+            "id": error_id,
+            "title": _truncate_string(summary, 100),
+            "fix": _truncate_string(fix, 140),
+            "count": len(error_instances)
         }
+        
+        # Add location sample if available
+        locations = _aggregate_locations(error_instances)
+        if locations:
+            item["locations_sample"] = locations
+        
         filtered.append(item)
     
     return filtered
@@ -96,36 +207,46 @@ def _filter_short(errors: List[Any]) -> List[Dict[str, Any]]:
 
 def _filter_balanced(errors: List[Any]) -> List[Dict[str, Any]]:
     """
-    Filter errors for BALANCED mode - add evidence and first 3 locations.
+    Filter errors for BALANCED mode with aggregation.
+    Groups by (id, summary, fix) and merges evidence conservatively.
+    
+    Output per group:
+    - id: Error identifier
+    - summary: Full summary (no truncation)
+    - fix: Full fix (no truncation)
+    - count: Number of merged instances
+    - locations_sample: First 3 locations (optional)
+    - evidence: Aggregated evidence with technical keys removed (optional)
     
     Args:
         errors: List of ValidationError objects
         
     Returns:
-        List of dicts with evidence and sample locations
+        List of dicts with aggregated evidence and sample locations
     """
+    # Group errors by (id, summary, fix)
+    groups = _group_errors(errors)
+    
     filtered = []
-    for error in errors:
-        # Skip suppressed errors
-        if error.suppressed:
-            continue
-            
-        # Build base dict
+    for (error_id, summary, fix), error_instances in groups.items():
+        # Build base item
         item = {
-            "id": error.id,
-            "summary": error.action.summary,
-            "fix": error.action.fix
+            "id": error_id,
+            "summary": summary,
+            "fix": fix,
+            "count": len(error_instances)
         }
         
-        # Add first 3 locations if available
-        if error.action.locations:
-            item["locations"] = error.action.locations[:3]
+        # Add location sample if available
+        locations = _aggregate_locations(error_instances)
+        if locations:
+            item["locations_sample"] = locations
         
-        # Add evidence if available (with technical keys removed)
-        if error.evidence:
-            evidence_dict = error.evidence.model_dump(exclude_none=True, exclude_unset=True)
-            # Recursively remove technical keys
-            cleaned_evidence = _remove_technical_keys(evidence_dict)
+        # Add aggregated evidence if available
+        merged_evidence = _aggregate_evidence(error_instances)
+        if merged_evidence:
+            # Remove technical keys recursively
+            cleaned_evidence = _remove_technical_keys(merged_evidence)
             if cleaned_evidence:  # Only include if non-empty after cleaning
                 item["evidence"] = cleaned_evidence
         
