@@ -1,140 +1,206 @@
 """
-Presentation layer for validation responses.
+Presentation layer for filtering validation responses based on output mode.
 
-This module applies output filtering based on user persona (OutputMode).
-It acts as the final transformation before JSON response.
-
-Architecture:
-    SVRL → Humanization → Tiered → Dedup → Suppression → [MODE FILTER] → JSON
-    
-The "Brain" (validation logic) always produces full ValidationError objects.
-The "Presentation" (this module) filters based on OutputMode.
+This module implements the "Presentation" side of the Brain-Presentation architecture.
+The Brain (deduplication, suppression) always produces full data-rich objects.
+This layer applies final transformations based on user persona (SHORT, BALANCED, DETAILED).
 """
-from typing import List, Dict, Any
-from diagnostics.models import ValidationError, OutputMode
+from typing import Any, Dict, List, Union
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Disallowed technical keys for BALANCED mode (recursive removal)
+TECHNICAL_KEYS = {
+    "technical_details", "debug_log", "raw_locations", "stacktrace", 
+    "trace", "paths", "raw", "internal", "raw_message"
+}
 
 
-def apply_mode_filter(errors: List[ValidationError], mode: OutputMode) -> Dict[str, Any]:
+def _normalize_mode(mode: Any) -> str:
     """
-    Apply output filtering based on diagnostic mode.
-    
-    Three user personas:
-    - SHORT (Supplier): Only id, summary, fix. No evidence, no technical details, no suppressed errors.
-    - BALANCED (Developer): Add evidence, limit to 3 sample locations, show suppressed errors.
-    - DETAILED (Auditor): Everything (all locations, full technical_details, suppressed errors).
+    Normalize mode input to lowercase string.
     
     Args:
-        errors: List of ValidationError objects (from "Brain")
-        mode: OutputMode enum value
+        mode: Can be OutputMode enum, string, or any type with .value attribute
         
     Returns:
-        Dict with filtered 'errors' and optionally 'suppressed' lists
+        Normalized mode string: "short", "balanced", or "detailed"
+        
+    Raises:
+        ValueError: If mode is invalid (strict behavior)
     """
-    # Separate root causes and suppressed errors
-    root_causes = [e for e in errors if not e.suppressed]
-    suppressed_errors = [e for e in errors if e.suppressed]
+    # Extract string representation
+    if hasattr(mode, "value"):
+        mode_str = str(mode.value).lower()
+    else:
+        mode_str = str(mode).lower()
     
-    if mode == OutputMode.SHORT:
-        # SHORT: Strip everything except id, summary, fix
-        filtered_errors = [
-            {
-                "id": error.id,
-                "severity": error.severity,
-                "action": {
-                    "summary": error.action.summary,
-                    "fix": error.action.fix,
-                    "locations": []  # Hide locations in SHORT mode
-                }
-            }
-            for error in root_causes
-        ]
-        return {"errors": filtered_errors}
+    # Validate
+    valid_modes = {"short", "balanced", "detailed"}
+    if mode_str not in valid_modes:
+        # Strict behavior: raise error for invalid mode
+        raise ValueError(f"Invalid mode '{mode_str}'. Must be one of: {valid_modes}")
     
-    elif mode == OutputMode.BALANCED:
-        # BALANCED: Keep evidence, limit locations to first 3, hide technical_details
-        filtered_errors = [
-            {
-                "id": error.id,
-                "severity": error.severity,
-                "action": {
-                    "summary": error.action.summary,
-                    "fix": error.action.fix,
-                    "locations": error.action.locations[:3]  # Limit to 3 samples
-                },
-                "evidence": error.evidence.dict() if error.evidence else None
-                # technical_details omitted
-            }
-            for error in root_causes
-        ]
-        
-        # Include suppressed errors with reasons
-        suppressed_list = [
-            {
-                "id": error.id,
-                "reason": f"Suppressed by root cause: {_extract_suppression_reason(error)}"
-            }
-            for error in suppressed_errors
-        ]
-        
-        return {
-            "errors": filtered_errors,
-            "suppressed": suppressed_list if suppressed_list else []
-        }
-    
-    else:  # OutputMode.DETAILED
-        # DETAILED: Keep everything (all locations, full technical_details)
-        filtered_errors = [
-            {
-                "id": error.id,
-                "severity": error.severity,
-                "action": {
-                    "summary": error.action.summary,
-                    "fix": error.action.fix,
-                    "locations": error.action.locations  # All locations
-                },
-                "evidence": error.evidence.dict() if error.evidence else None,
-                "technical_details": error.technical_details.dict() if error.technical_details else None
-            }
-            for error in root_causes
-        ]
-        
-        # Include suppressed errors with full details
-        suppressed_list = [
-            {
-                "id": error.id,
-                "severity": error.severity,
-                "reason": f"Suppressed by root cause: {_extract_suppression_reason(error)}",
-                "action": {
-                    "summary": error.action.summary,
-                    "fix": error.action.fix,
-                    "locations": error.action.locations
-                },
-                "technical_details": error.technical_details.dict() if error.technical_details else None
-            }
-            for error in suppressed_errors
-        ]
-        
-        return {
-            "errors": filtered_errors,
-            "suppressed": suppressed_list if suppressed_list else []
-        }
+    return mode_str
 
 
-def _extract_suppression_reason(error: ValidationError) -> str:
+def _remove_technical_keys(data: Any) -> Any:
     """
-    Extract the reason why an error was suppressed from its summary.
+    Recursively remove technical keys from nested dictionaries.
     
     Args:
-        error: ValidationError that was suppressed
+        data: Dictionary, list, or primitive value
         
     Returns:
-        Reason string (e.g., "R051 present")
+        Cleaned data structure with technical keys removed
     """
-    summary = error.action.summary
+    if isinstance(data, dict):
+        return {
+            k: _remove_technical_keys(v)
+            for k, v in data.items()
+            if k not in TECHNICAL_KEYS
+        }
+    elif isinstance(data, list):
+        return [_remove_technical_keys(item) for item in data]
+    else:
+        return data
+
+
+def _filter_short(errors: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Filter errors for SHORT mode - only id, summary, fix.
     
-    # Look for "(Suppressed: reason)" pattern
-    if "(Suppressed:" in summary:
-        reason = summary.split("(Suppressed:")[-1].rstrip(")")
-        return reason.strip()
+    Args:
+        errors: List of ValidationError objects
+        
+    Returns:
+        List of minimal dicts with whitelist fields only
+    """
+    filtered = []
+    for error in errors:
+        # Skip suppressed errors
+        if error.suppressed:
+            continue
+            
+        # Build dict with only allowed fields
+        item = {
+            "id": error.id,
+            "summary": error.action.summary,
+            "fix": error.action.fix
+        }
+        filtered.append(item)
     
-    return "Cascade error"
+    return filtered
+
+
+def _filter_balanced(errors: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Filter errors for BALANCED mode - add evidence and first 3 locations.
+    
+    Args:
+        errors: List of ValidationError objects
+        
+    Returns:
+        List of dicts with evidence and sample locations
+    """
+    filtered = []
+    for error in errors:
+        # Skip suppressed errors
+        if error.suppressed:
+            continue
+            
+        # Build base dict
+        item = {
+            "id": error.id,
+            "summary": error.action.summary,
+            "fix": error.action.fix
+        }
+        
+        # Add first 3 locations if available
+        if error.action.locations:
+            item["locations"] = error.action.locations[:3]
+        
+        # Add evidence if available (with technical keys removed)
+        if error.evidence:
+            evidence_dict = error.evidence.model_dump(exclude_none=True, exclude_unset=True)
+            # Recursively remove technical keys
+            cleaned_evidence = _remove_technical_keys(evidence_dict)
+            if cleaned_evidence:  # Only include if non-empty after cleaning
+                item["evidence"] = cleaned_evidence
+        
+        filtered.append(item)
+    
+    return filtered
+
+
+def _filter_detailed(errors: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Filter errors for DETAILED mode - include everything.
+    
+    Args:
+        errors: List of ValidationError objects
+        
+    Returns:
+        List of full error dicts with all fields
+    """
+    return [error.model_dump(exclude_none=False) for error in errors]
+
+
+def apply_mode_filter(mode: Any, validation_response: Any) -> Dict[str, Any]:
+    """
+    Apply presentation filtering based on output mode.
+    
+    This is the final transformation step that converts the full Brain output
+    into a JSON-safe envelope appropriate for the user persona.
+    
+    Args:
+        mode: Output mode (SHORT, BALANCED, or DETAILED)
+        validation_response: Full validation response from Brain
+        
+    Returns:
+        JSON-safe dictionary envelope with filtered content
+        
+    Raises:
+        ValueError: If mode is invalid
+    """
+    # Normalize mode to string
+    mode_str = _normalize_mode(mode)
+    
+    logger.debug(f"Applying {mode_str.upper()} mode filter")
+    
+    # Filter errors based on mode
+    if mode_str == "short":
+        diagnosis = _filter_short(validation_response.errors)
+    elif mode_str == "balanced":
+        diagnosis = _filter_balanced(validation_response.errors)
+    else:  # detailed
+        diagnosis = _filter_detailed(validation_response.errors)
+    
+    # Build meta - handle both Pydantic and dict
+    if hasattr(validation_response.meta, 'model_dump'):
+        if mode_str in ("short", "balanced"):
+            meta_dict = validation_response.meta.model_dump(exclude_none=True, exclude_unset=True)
+        else:  # detailed
+            meta_dict = validation_response.meta.model_dump(exclude_none=False)
+    elif isinstance(validation_response.meta, dict):
+        if mode_str in ("short", "balanced"):
+            # Remove None values from dict
+            meta_dict = {k: v for k, v in validation_response.meta.items() if v is not None}
+        else:  # detailed
+            meta_dict = validation_response.meta.copy()
+    else:
+        meta_dict = {}
+    
+    # Build JSON-safe envelope
+    envelope = {
+        "status": validation_response.status,
+        "meta": meta_dict,
+        "diagnosis": diagnosis
+    }
+    
+    # Add debug_log only in DETAILED mode
+    if mode_str == "detailed" and validation_response.debug_log:
+        envelope["debug_log"] = validation_response.debug_log
+    
+    return envelope

@@ -15,6 +15,7 @@ from typing import List, Dict, Optional
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, status
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 
 # Enhanced imports
@@ -126,43 +127,6 @@ async def root():
     }
 
 
-def _apply_presentation_filter(response: ValidationResponse, mode: OutputMode) -> Dict:
-    """
-    Apply presentation layer filtering to ValidationResponse based on mode.
-    
-    This is the final transformation before JSON response.
-    Architecture: Brain (validation) → Presentation (filtering) → JSON
-    
-    Args:
-        response: Complete ValidationResponse from "Brain"
-        mode: Output filtering mode
-        
-    Returns:
-        Dict suitable for JSONResponse with filtered errors
-    """
-    # Apply mode filter to errors list
-    filtered_result = apply_mode_filter(response.errors, mode)
-    
-    # Build response dict
-    result = {
-        "status": response.status,
-        "meta": {
-            "engine": response.meta.engine,
-            "rules_tag": response.meta.rules_tag,
-            "commit": response.meta.commit
-        }
-    }
-    
-    # Add filtered errors (renamed from 'errors' to match new structure)
-    result.update(filtered_result)
-    
-    # Include debug_log if present (only in DETAILED mode or if explicitly set)
-    if mode == OutputMode.DETAILED and response.debug_log:
-        result["debug_log"] = response.debug_log
-    
-    return result
-
-
 @app.post("/validate")
 async def validate_invoice(
     file: UploadFile = File(...),
@@ -214,8 +178,17 @@ async def validate_invoice(
         # Acquire semaphore for validation
         async with validation_semaphore:
             result = await validate_file(session_id, input_path, mode)
-            filtered_result = _apply_presentation_filter(result, mode)
-            return JSONResponse(content=filtered_result)
+            # Apply presentation filtering and ensure JSON-safe serialization
+            try:
+                filtered_result = apply_mode_filter(mode, result)
+                json_safe_result = jsonable_encoder(filtered_result)
+                return JSONResponse(content=json_safe_result)
+            except ValueError as e:
+                # Invalid mode
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=str(e)
+                )
     
     except HTTPException:
         raise
@@ -242,8 +215,13 @@ async def validate_invoice(
             errors=[convert_flat_to_tiered(internal_error, session_id)],
             debug_log=None
         )
-        filtered_error = _apply_presentation_filter(error_response, mode)
-        return JSONResponse(content=filtered_error)
+        try:
+            filtered_error = apply_mode_filter(mode, error_response)
+            return JSONResponse(content=jsonable_encoder(filtered_error))
+        except ValueError:
+            # If mode is invalid, default to balanced
+            filtered_error = apply_mode_filter(OutputMode.BALANCED, error_response)
+            return JSONResponse(content=jsonable_encoder(filtered_error))
     finally:
         # Always cleanup temp directory
         if os.path.exists(session_dir):
