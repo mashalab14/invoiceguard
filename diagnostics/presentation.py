@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Tuple
 from collections import defaultdict
 import logging
 
+from diagnostics.message_catalog import get_title, get_short_fix
+
 logger = logging.getLogger(__name__)
 
 # Disallowed technical keys for BALANCED mode (recursive removal)
@@ -71,22 +73,6 @@ def _remove_technical_keys(data: Any) -> Any:
         return data
 
 
-def _truncate_string(text: str, max_length: int) -> str:
-    """
-    Truncate string to max_length, adding ellipsis if truncated.
-    
-    Args:
-        text: String to truncate
-        max_length: Maximum length (including ellipsis)
-        
-    Returns:
-        Truncated string with '...' appended if shortened
-    """
-    if not text or len(text) <= max_length:
-        return text
-    return text[:max_length - 3] + "..."
-
-
 def _group_errors(errors: List[Any]) -> Dict[Tuple[str, str, str], List[Any]]:
     """
     Group errors by (id, summary, fix) to identify repeated issues.
@@ -126,7 +112,12 @@ def _aggregate_locations(errors: List[Any]) -> List[str]:
 def _aggregate_evidence(errors: List[Any]) -> Dict[str, Any]:
     """
     Merge evidence from multiple error instances conservatively.
-    Only includes fields that appear in all instances.
+    
+    Strategy:
+    - Set occurrence_count to the total number of instances
+    - For numeric dict values (e.g., currency_ids_found), sum the counts
+    - For list fields, collect unique values
+    - For scalar fields, use first instance value
     
     Args:
         errors: List of error instances with same underlying issue
@@ -151,9 +142,26 @@ def _aggregate_evidence(errors: List[Any]) -> Dict[str, Any]:
     # Start with first evidence as base
     merged = evidence_dicts[0].copy()
     
-    # For lists/arrays, merge by collecting unique values
+    # Set occurrence_count to total number of instances
+    merged['occurrence_count'] = len(errors)
+    
+    # For numeric dict fields (like currency_ids_found), sum the values
     for key in list(merged.keys()):
-        if isinstance(merged[key], list):
+        if isinstance(merged[key], dict):
+            # Check if values are numeric (summable)
+            first_val = next(iter(merged[key].values()), None)
+            if isinstance(first_val, (int, float)):
+                # Sum counts across all instances
+                summed = {}
+                for ev in evidence_dicts:
+                    if key in ev and isinstance(ev[key], dict):
+                        for k, v in ev[key].items():
+                            if isinstance(v, (int, float)):
+                                summed[k] = summed.get(k, 0) + v
+                merged[key] = summed
+        
+        # For lists/arrays, merge by collecting unique values
+        elif isinstance(merged[key], list):
             all_values = []
             for ev in evidence_dicts:
                 if key in ev and isinstance(ev[key], list):
@@ -167,12 +175,12 @@ def _aggregate_evidence(errors: List[Any]) -> Dict[str, Any]:
 def _filter_short(errors: List[Any]) -> List[Dict[str, Any]]:
     """
     Filter errors for SHORT mode with aggressive aggregation.
-    Groups by (id, summary, fix) and truncates strings.
+    Groups by (id, summary, fix) and uses message catalog for titles/fixes.
     
     Output per group:
     - id: Error identifier
-    - title: Truncated summary (≤100 chars)
-    - fix: Truncated fix (≤140 chars)
+    - title: Short headline from catalog or generated (≤70 chars, no ellipsis)
+    - fix: Short fix from catalog or generated (≤120 chars, no ellipsis)
     - count: Number of merged instances
     - locations_sample: First 3 locations (optional)
     
@@ -187,11 +195,11 @@ def _filter_short(errors: List[Any]) -> List[Dict[str, Any]]:
     
     filtered = []
     for (error_id, summary, fix), error_instances in groups.items():
-        # Build aggregated item
+        # Build aggregated item using message catalog
         item = {
             "id": error_id,
-            "title": _truncate_string(summary, 100),
-            "fix": _truncate_string(fix, 140),
+            "title": get_title(error_id, summary),
+            "fix": get_short_fix(error_id, fix),
             "count": len(error_instances)
         }
         
@@ -218,6 +226,8 @@ def _filter_balanced(errors: List[Any]) -> List[Dict[str, Any]]:
     - locations_sample: First 3 locations (optional)
     - evidence: Aggregated evidence with technical keys removed (optional)
     
+    Note: Technical key removal happens AFTER evidence merging.
+    
     Args:
         errors: List of ValidationError objects
         
@@ -243,9 +253,10 @@ def _filter_balanced(errors: List[Any]) -> List[Dict[str, Any]]:
             item["locations_sample"] = locations
         
         # Add aggregated evidence if available
+        # First merge, then clean technical keys
         merged_evidence = _aggregate_evidence(error_instances)
         if merged_evidence:
-            # Remove technical keys recursively
+            # Remove technical keys recursively AFTER merging
             cleaned_evidence = _remove_technical_keys(merged_evidence)
             if cleaned_evidence:  # Only include if non-empty after cleaning
                 item["evidence"] = cleaned_evidence
