@@ -2,6 +2,10 @@
 """
 Test TIER0 mode - raw KoSIT findings only, no enrichment.
 
+NOTE: This test requires the KoSIT validator JAR to be available at /app/validator.jar
+      or VALIDATOR_JAR environment variable pointing to a valid JAR file.
+      In dev mode without the validator, this test will skip.
+
 Validates:
 1. Every KoSIT notice becomes one returned issue
 2. action.summary equals exact KoSIT message text
@@ -13,6 +17,7 @@ Validates:
 import sys
 import json
 import requests
+import pytest
 
 
 def test_tier0_mode():
@@ -36,22 +41,20 @@ def test_tier0_mode():
             files = {'file': (test_file, f, 'application/xml')}
             params = {'mode': 'tier0'}
             response = requests.post(
-                'http://localhost:8000/validate',
+                'http://localhost:8080/validate',
                 files=files,
                 params=params,
                 timeout=30
             )
         
-        if response.status_code != 200:
-            print(f"❌ Request failed with status {response.status_code}")
-            print(f"Response: {response.text}")
-            return False
+        assert response.status_code == 200, f"Request failed with status {response.status_code}: {response.text}"
         
         result = response.json()
         print(f"✓ Request successful (status 200)")
+    except requests.exceptions.ConnectionError:
+        pytest.skip("API server not running on localhost:8080")
     except Exception as e:
-        print(f"❌ Error making request: {e}")
-        return False
+        pytest.fail(f"Error making request: {e}")
     
     print()
     
@@ -59,36 +62,33 @@ def test_tier0_mode():
     print("VALIDATION 1: Response structure")
     print("-" * 60)
     
-    required_keys = ['status', 'meta', 'diagnosis']
+    required_keys = ['status', 'meta', 'errors']
     for key in required_keys:
-        if key not in result:
-            print(f"❌ Missing required key: {key}")
-            return False
+        assert key in result, f"Missing required key: {key}"
     
     print(f"✓ All required keys present: {required_keys}")
     print()
+    
+    # Check if validator is available
+    if result['status'] == 'ERROR' and result['errors'][0]['id'] == 'EXECUTION_ERROR':
+        pytest.skip("KoSIT validator JAR not available - skipping integration test")
     
     # Validation 2: Check kosit field presence
     print("VALIDATION 2: Raw KoSIT report presence")
     print("-" * 60)
     
-    if 'kosit' not in result:
-        print(f"❌ Missing 'kosit' field in TIER0 response")
-        return False
-    
+    assert 'kosit' in result, "Missing 'kosit' field in TIER0 response"
     print(f"✓ 'kosit' field present")
     
     kosit = result['kosit']
-    if 'report_xml' not in kosit:
-        print(f"❌ Missing 'report_xml' in kosit field")
-        return False
+    assert kosit is not None, "'kosit' field is None"
+    
+    assert 'report_xml' in kosit, "Missing 'report_xml' in kosit field"
     
     print(f"✓ 'report_xml' present in kosit field")
     
     report_xml = kosit['report_xml']
-    if not report_xml or len(report_xml) < 100:
-        print(f"❌ report_xml seems empty or too short ({len(report_xml)} bytes)")
-        return False
+    assert report_xml and len(report_xml) >= 100, f"report_xml seems empty or too short ({len(report_xml) if report_xml else 0} bytes)"
     
     print(f"✓ report_xml has content ({len(report_xml)} bytes)")
     
@@ -100,32 +100,30 @@ def test_tier0_mode():
     
     print()
     
-    # Validation 3: Check diagnosis structure
-    print("VALIDATION 3: Diagnosis structure (raw KoSIT format)")
+    # Validation 3: Check errors structure
+    print("VALIDATION 3: Errors structure (raw KoSIT format)")
     print("-" * 60)
     
-    diagnosis = result['diagnosis']
-    print(f"Number of issues: {len(diagnosis)}")
+    errors = result['errors']
+    print(f"Number of issues: {len(errors)}")
     
-    if len(diagnosis) == 0:
+    if len(errors) == 0:
         print(f"⚠️ No issues found (invoice might be valid)")
         print()
         print("=" * 60)
         print("✅ TIER0 MODE TEST PASSED (no issues found)")
         print("=" * 60)
-        return True
+        return
     
     print()
     
     # Check first issue structure
-    first_issue = diagnosis[0]
+    first_issue = errors[0]
     print(f"First issue keys: {sorted(first_issue.keys())}")
     
     required_issue_keys = ['id', 'severity', 'action', 'technical_details']
     for key in required_issue_keys:
-        if key not in first_issue:
-            print(f"❌ Missing required key in issue: {key}")
-            return False
+        assert key in first_issue, f"Missing required key in issue: {key}"
     
     print(f"✓ All required issue keys present")
     print()
@@ -138,19 +136,13 @@ def test_tier0_mode():
     required_action_keys = ['summary', 'fix', 'locations']
     
     for key in required_action_keys:
-        if key not in action:
-            print(f"❌ Missing required key in action: {key}")
-            return False
+        assert key in action, f"Missing required key in action: {key}"
     
     print(f"✓ All required action keys present")
     
     # Check that fix is the generic constant
     expected_fix = "See rule description and correct the invoice data accordingly."
-    if action['fix'] != expected_fix:
-        print(f"❌ Fix message is not the expected constant")
-        print(f"  Expected: {expected_fix}")
-        print(f"  Got: {action['fix']}")
-        return False
+    assert action['fix'] == expected_fix, f"Fix message is not the expected constant. Expected: {expected_fix}, Got: {action['fix']}"
     
     print(f"✓ Fix message is the generic constant")
     print()
@@ -163,18 +155,13 @@ def test_tier0_mode():
     required_tech_keys = ['raw_message', 'raw_locations']
     
     for key in required_tech_keys:
-        if key not in tech_details:
-            print(f"❌ Missing required key in technical_details: {key}")
-            return False
+        assert key in tech_details, f"Missing required key in technical_details: {key}"
     
     print(f"✓ All required technical_details keys present")
     
     # Check that raw_message matches action.summary (verbatim)
-    if tech_details['raw_message'] != action['summary']:
-        print(f"❌ raw_message does not match action.summary")
-        print(f"  raw_message: {tech_details['raw_message']}")
-        print(f"  summary: {action['summary']}")
-        return False
+    assert tech_details['raw_message'] == action['summary'], \
+        f"raw_message does not match action.summary. raw_message: {tech_details['raw_message']}, summary: {action['summary']}"
     
     print(f"✓ raw_message matches action.summary (verbatim)")
     print()
@@ -201,9 +188,7 @@ def test_tier0_mode():
         if phrase in issue_str:
             found_enrichment.append(phrase)
     
-    if found_enrichment:
-        print(f"❌ Found enrichment phrases in TIER0 output: {found_enrichment}")
-        return False
+    assert not found_enrichment, f"Found enrichment phrases in TIER0 output: {found_enrichment}"
     
     print(f"✓ No enrichment phrases found")
     print()
@@ -212,9 +197,7 @@ def test_tier0_mode():
     print("VALIDATION 7: No evidence field in TIER0")
     print("-" * 60)
     
-    if 'evidence' in first_issue:
-        print(f"❌ 'evidence' field should not be present in TIER0 mode")
-        return False
+    assert 'evidence' not in first_issue, "'evidence' field should not be present in TIER0 mode"
     
     print(f"✓ No 'evidence' field (correct for TIER0)")
     print()
@@ -224,24 +207,20 @@ def test_tier0_mode():
     print("-" * 60)
     
     suppressed_count = 0
-    for issue in diagnosis:
+    for issue in errors:
         if issue.get('suppressed', False):
             suppressed_count += 1
     
-    if suppressed_count > 0:
-        print(f"❌ Found {suppressed_count} suppressed issues in TIER0 mode")
-        return False
+    assert suppressed_count == 0, f"Found {suppressed_count} suppressed issues in TIER0 mode"
     
-    print(f"✓ No suppressed issues (all {len(diagnosis)} issues reported)")
+    print(f"✓ No suppressed issues (all {len(errors)} issues reported)")
     print()
     
     # Validation 9: Check that count field is NOT present (no aggregation)
     print("VALIDATION 9: No aggregation in TIER0")
     print("-" * 60)
     
-    if 'count' in first_issue:
-        print(f"❌ 'count' field should not be present in TIER0 (no aggregation)")
-        return False
+    assert 'count' not in first_issue, "'count' field should not be present in TIER0 (no aggregation)"
     
     print(f"✓ No 'count' field (no aggregation in TIER0)")
     print()
@@ -251,15 +230,13 @@ def test_tier0_mode():
     print("=" * 60)
     print()
     print("SUMMARY:")
-    print(f"  - {len(diagnosis)} raw KoSIT findings returned")
+    print(f"  - {len(errors)} raw KoSIT findings returned")
     print(f"  - Raw report XML included ({len(report_xml)} bytes)")
     print(f"  - No enrichment, no aggregation, no suppression")
     print(f"  - All findings have verbatim KoSIT messages")
     print()
-    
-    return True
 
 
 if __name__ == "__main__":
-    success = test_tier0_mode()
-    sys.exit(0 if success else 1)
+    test_tier0_mode()
+    sys.exit(0)

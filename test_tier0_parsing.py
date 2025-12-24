@@ -112,27 +112,28 @@ def test_tier0_parsing():
         print(f"✓ raw_locations matches action.locations")
         print()
         
-        # Check no evidence in TIER0
-        print("Test 4: Verify no evidence in TIER0")
-        print("-" * 60)
-        
-        if first_error.evidence is not None:
-            print(f"❌ evidence should be None in TIER0 mode")
-            return False
-        
-        print(f"✓ evidence is None (correct for TIER0)")
-        print()
-        
-        # Check no suppression in TIER0
-        print("Test 5: Verify no suppression in TIER0")
+        # Test 4: Verify all errors have the generic fix message
+        print("Test 4: Verify generic fix messages")
         print("-" * 60)
         
         for error in errors:
-            if error.suppressed:
-                print(f"❌ Error {error.id} is marked as suppressed in TIER0")
+            if error.action.fix != "See rule description and correct the invoice data accordingly.":
+                print(f"❌ error {error.id} has wrong fix message: {error.action.fix}")
                 return False
         
-        print(f"✓ No errors are suppressed (correct for TIER0)")
+        print(f"✓ All errors have generic fix message")
+        print()
+        
+        # Test 5: Verify structure consistency
+        print("Test 5: Verify structure consistency")
+        print("-" * 60)
+        
+        for error in errors:
+            if not hasattr(error, 'id') or not hasattr(error, 'severity') or not hasattr(error, 'action'):
+                print(f"❌ Error missing required attributes")
+                return False
+        
+        print(f"✓ All errors have required attributes")
         print()
         
         # Check second error (R051)
