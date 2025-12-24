@@ -12,10 +12,10 @@ import uuid
 import xml.etree.ElementTree as ET
 from typing import List, Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, status
+from fastapi import FastAPI, File, UploadFile, HTTPException, status, Query
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Tier 0 imports - raw KoSIT only
 from diagnostics.models import ValidationError, ErrorAction, DebugContext, OutputMode, KoSITReport
@@ -49,11 +49,11 @@ class ValidationMeta(BaseModel):
 
 
 class ValidationResponse(BaseModel):
-    status: str  # PASSED, REJECTED, ERROR
-    meta: ValidationMeta
-    errors: List[ValidationError]
-    debug_log: Optional[str] = None
-    kosit: Optional[KoSITReport] = None  # Raw KoSIT report
+    status: str = Field(..., description="Validation status: PASSED, REJECTED, or ERROR")
+    meta: ValidationMeta = Field(..., description="Validation engine metadata")
+    errors: List[ValidationError] = Field(..., description="List of validation errors found")
+    debug_log: Optional[str] = Field(None, description="Debug log for troubleshooting")
+    kosit: Optional[KoSITReport] = Field(None, description="Raw KoSIT report (XML + HTML). Include with include_kosit_report=true")
 
 
 def load_config():
@@ -112,20 +112,58 @@ async def root():
 
 @app.post("/validate")
 async def validate_invoice(
-    file: UploadFile = File(...),
-    mode: OutputMode = OutputMode.TIER0
+    file: UploadFile = File(..., description="Invoice XML file to validate (max 10MB)"),
+    mode: OutputMode = Query(OutputMode.TIER0, description="Output mode (only TIER0 supported)"),
+    include_kosit_report: Optional[bool] = Query(
+        True,
+        description="Include raw KoSIT report (XML + HTML) in response. "
+                    "Accepted values: true, false, 1, 0. "
+                    "Default: true (when omitted). "
+                    "Set to false to reduce response size."
+    )
 ):
     """
     Validate a Peppol BIS 3.0 invoice against KoSIT rules.
     
-    Tier 0 Mode: Returns raw KoSIT findings with no enrichment.
+    **Tier 0 Mode**: Returns raw KoSIT findings with no enrichment.
+    
+    **Query Parameters:**
+    - `mode`: Output mode (only TIER0 supported)
+    - `include_kosit_report`: Control KoSIT report inclusion in response
+    
+    **Response includes:**
+    - `status`: PASSED, REJECTED, or ERROR
+    - `meta`: Validation engine metadata
+    - `errors`: List of validation errors
+    - `kosit`: Raw KoSIT report (only if include_kosit_report=true)
+    
+    **Examples:**
+    
+    Without KoSIT report (smaller response):
+    ```bash
+    curl -X POST "http://localhost:8080/validate?mode=tier0&include_kosit_report=false" \\
+         -F "file=@invoice.xml"
+    ```
+    
+    With KoSIT report (default):
+    ```bash
+    curl -X POST "http://localhost:8080/validate?mode=tier0&include_kosit_report=true" \\
+         -F "file=@invoice.xml"
+    ```
+    
+    Omit flag (uses default = true):
+    ```bash
+    curl -X POST "http://localhost:8080/validate?mode=tier0" \\
+         -F "file=@invoice.xml"
+    ```
     
     Args:
         file: Invoice XML file to validate
         mode: Output mode (only TIER0 supported)
+        include_kosit_report: Whether to include raw KoSIT report in response
     
     Returns:
-        JSONResponse with raw KoSIT validation results and report
+        JSONResponse with raw KoSIT validation results (and optionally report)
     """
     if mode != OutputMode.TIER0:
         raise HTTPException(
@@ -160,8 +198,15 @@ async def validate_invoice(
         logger.info(f"Session {session_id}: Received file ({file_size} bytes)")
         
         async with validation_semaphore:
-            result = await validate_file(session_id, input_path)
-            return JSONResponse(content=jsonable_encoder(result.dict()))
+            result = await validate_file(session_id, input_path, include_kosit_report)
+            # Convert to dict
+            response_dict = result.dict()
+            # Conditionally remove kosit field based on flag
+            if not include_kosit_report and 'kosit' in response_dict:
+                del response_dict['kosit']
+            # Remove other None fields (but not kosit if we want to keep it)
+            response_dict = {k: v for k, v in response_dict.items() if v is not None or (k == 'kosit' and include_kosit_report)}
+            return JSONResponse(content=jsonable_encoder(response_dict))
     
     except HTTPException:
         raise
@@ -188,9 +233,15 @@ async def validate_invoice(
                     raw_locations=[]
                 )
             )],
-            debug_log=str(e)
+            debug_log=str(e),
+            kosit=None  # Error case - no report available
         )
-        return JSONResponse(content=jsonable_encoder(error_response.dict()))
+        response_dict = error_response.dict()
+        if not include_kosit_report and 'kosit' in response_dict:
+            del response_dict['kosit']
+        # Remove other None fields
+        response_dict = {k: v for k, v in response_dict.items() if v is not None or (k == 'kosit' and include_kosit_report)}
+        return JSONResponse(content=jsonable_encoder(response_dict))
     finally:
         if os.path.exists(session_dir):
             try:
@@ -200,13 +251,40 @@ async def validate_invoice(
                 logger.error(f"Session {session_id}: Failed to cleanup: {e}")
 
 
-async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
+def create_validation_response(
+    status: str,
+    meta: ValidationMeta,
+    errors: List[ValidationError],
+    debug_log: Optional[str] = None,
+    kosit: Optional[KoSITReport] = None,
+    include_kosit: bool = True
+) -> ValidationResponse:
+    """
+    Create a ValidationResponse with optional kosit field.
+    
+    When include_kosit=False, the kosit field is set to None so that
+    exclude_none=True in dict() will remove it from the response.
+    """
+    if not include_kosit:
+        kosit = None
+    
+    return ValidationResponse(
+        status=status,
+        meta=meta,
+        errors=errors,
+        debug_log=debug_log,
+        kosit=kosit
+    )
+
+
+async def validate_file(session_id: str, input_path: str, include_kosit_report: bool = True) -> ValidationResponse:
     """
     Execute validation logic for a single file (Tier 0 only).
     
     Args:
         session_id: Unique session identifier
         input_path: Path to input XML file
+        include_kosit_report: Whether to include raw KoSIT report in response
         
     Returns:
         ValidationResponse with raw KoSIT results
@@ -241,7 +319,8 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                     raw_locations=[]
                 )
             )],
-            debug_log=str(e)
+            debug_log=str(e),
+            kosit=None  # Error case - no report available
         )
     
     # Build Java command
@@ -295,7 +374,8 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                         raw_locations=[]
                     )
                 )],
-                debug_log=None
+                debug_log=None,
+                kosit=None  # Error case - no report available
             )
         
         logger.info(f"Session {session_id}: Validator completed")
@@ -322,7 +402,8 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                     raw_locations=[]
                 )
             )],
-            debug_log=None
+            debug_log=None,
+            kosit=None  # Error case - no report available
         )
     
     # Find report file
@@ -357,7 +438,8 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                     raw_locations=[]
                 )
             )],
-            debug_log=f"STDOUT: {stdout_text}\nSTDERR: {stderr_text}"
+            debug_log=f"STDOUT: {stdout_text}\nSTDERR: {stderr_text}",
+            kosit=None  # Error case - no report available
         )
     
     if not report_path or not os.path.exists(report_path):
@@ -384,7 +466,8 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
                     raw_locations=[]
                 )
             )],
-            debug_log=f"STDOUT: {stdout_text}\nSTDERR: {stderr_text}"
+            debug_log=f"STDOUT: {stdout_text}\nSTDERR: {stderr_text}",
+            kosit=None  # Error case - no report available
         )
     
     # Parse report XML
@@ -393,7 +476,7 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
         root = tree.getroot()
     except ET.ParseError as e:
         logger.error(f"Session {session_id}: KoSIT output malformed: {e}")
-        kosit_report = read_report_files(output_dir, session_id)
+        kosit_report = read_report_files(output_dir, session_id) if include_kosit_report else None
         return ValidationResponse(
             status="ERROR",
             meta=ValidationMeta(
@@ -421,8 +504,8 @@ async def validate_file(session_id: str, input_path: str) -> ValidationResponse:
     # Parse raw KoSIT findings (Tier 0 only)
     errors = parse_kosit_report_tier0(root, session_id)
     
-    # Read raw report files
-    kosit_report = read_report_files(output_dir, session_id)
+    # Read raw report files (only if requested)
+    kosit_report = read_report_files(output_dir, session_id) if include_kosit_report else None
     
     # Determine status
     if errors:
