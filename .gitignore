@@ -48,6 +48,12 @@ htmlcov/
 /tmp/
 *.tmp
 /app/temp/
+temp_dev/
 
 # Docker
 *.tar
+
+# Development artifacts
+test_output.txt
+*_SUMMARY.txt
+*_SUMMARY.md
