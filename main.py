@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 # Enhanced imports
 from diagnostics.pipeline import DiagnosticsPipeline
-from diagnostics.models import ValidationError, ErrorAction, ErrorEvidence, DebugContext, OutputMode
+from diagnostics.models import ValidationError, ErrorAction, ErrorEvidence, DebugContext, OutputMode, KoSITReport
 from diagnostics.presentation import apply_mode_filter
 
 # Configure logging
@@ -56,6 +56,7 @@ class ValidationResponse(BaseModel):
     meta: ValidationMeta
     errors: List[ValidationError]
     debug_log: Optional[str] = None
+    kosit: Optional[KoSITReport] = None  # Raw KoSIT report (included in TIER0 mode)
 
 
 # Read configuration at startup
@@ -130,16 +131,17 @@ async def root():
 @app.post("/validate")
 async def validate_invoice(
     file: UploadFile = File(...),
-    mode: OutputMode = OutputMode.BALANCED
+    mode: OutputMode = OutputMode.TIER0
 ):
     """
     Validate a Peppol BIS 3.0 invoice against KoSIT rules.
     
     Args:
         file: Invoice XML file to validate
-        mode: Output filtering mode (SHORT, BALANCED, DETAILED)
+        mode: Output filtering mode
+              - TIER0: Raw KoSIT findings only, no enrichment, includes raw report [default]
               - SHORT: Only id, summary, fix (for Suppliers)
-              - BALANCED: Add evidence, 3 sample locations (for Developers) [default]
+              - BALANCED: Add evidence, 3 sample locations (for Developers)
               - DETAILED: Everything including all locations and raw logs (for Auditors)
     
     Returns:
@@ -261,6 +263,132 @@ def clean_xpath(xpath: str) -> str:
     cleaned = re.sub(r'/(cbc|cac|ubl|qdt|ccts):', '/', cleaned)
     
     return cleaned
+
+
+def parse_kosit_report_tier0(root: ET.Element, session_id: str) -> List[ValidationError]:
+    """
+    Parse KoSIT report in TIER0 mode - raw findings only, no enrichment.
+    
+    Args:
+        root: XML root element of KoSIT report
+        session_id: Session ID for logging
+        
+    Returns:
+        List of ValidationError objects with raw KoSIT data only
+    """
+    errors = []
+    failed_items = []
+    
+    # Parse both KoSIT VARL and Standard SVRL formats
+    for elem in root.iter():
+        tag_name = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+        
+        # KoSIT VARL Format: <rep:message code="BR-CO-15" level="error">Text</rep:message>
+        if tag_name == 'message':
+            error_code = elem.get('code')
+            if error_code:
+                failed_items.append({'type': 'kosit', 'elem': elem})
+        
+        # Standard SVRL Format: <svrl:failed-assert id="BR-CO-15"><svrl:text>Text</svrl:text>
+        elif tag_name == 'failed-assert':
+            failed_items.append({'type': 'svrl', 'elem': elem})
+    
+    logger.debug(f"Session {session_id}: Found {len(failed_items)} raw findings in TIER0 mode")
+    
+    for item in failed_items:
+        elem = item['elem']
+        
+        if item['type'] == 'kosit':
+            error_code = elem.get('code', 'UNKNOWN')
+            severity = elem.get('level', 'error')
+            raw_location = elem.get('xpathLocation', '')
+            raw_message = elem.text.strip() if elem.text else "Validation failed"
+        else:
+            error_code = elem.get('id') or elem.get('location') or "UNKNOWN"
+            severity = "error"
+            raw_location = elem.get('location', '')
+            raw_message = "Validation failed"
+            for child in elem:
+                child_tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                if child_tag == 'text' and child.text:
+                    raw_message = child.text.strip()
+                    break
+        
+        # TIER0: Create ValidationError with raw data only
+        # - action.summary = raw KoSIT message (verbatim)
+        # - action.fix = generic constant string
+        # - locations = raw locations from KoSIT
+        # - no evidence (TIER0 doesn't compute this)
+        # - technical_details preserved verbatim
+        error = ValidationError(
+            id=error_code,
+            severity=severity,
+            action=ErrorAction(
+                summary=raw_message,  # Verbatim KoSIT message
+                fix="See rule description and correct the invoice data accordingly.",  # Generic constant
+                locations=[raw_location] if raw_location else []
+            ),
+            evidence=None,  # No enrichment in TIER0
+            technical_details=DebugContext(
+                raw_message=raw_message,
+                raw_locations=[raw_location] if raw_location else []
+            ),
+            suppressed=False  # No suppression in TIER0
+        )
+        errors.append(error)
+    
+    return errors
+
+
+def read_report_files(output_dir: str, session_id: str) -> KoSITReport:
+    """
+    Read KoSIT report files (XML and optionally HTML).
+    
+    Args:
+        output_dir: Directory containing report files
+        session_id: Session ID for logging
+        
+    Returns:
+        KoSITReport object with report content
+    """
+    report_xml_content = None
+    report_html_content = None
+    
+    if os.path.exists(output_dir):
+        output_files = os.listdir(output_dir)
+        
+        # Read XML report
+        for filename in output_files:
+            if filename.endswith('-report.xml') or filename == 'input-report.xml':
+                xml_path = os.path.join(output_dir, filename)
+                try:
+                    with open(xml_path, 'r', encoding='utf-8') as f:
+                        report_xml_content = f.read()
+                    logger.debug(f"Session {session_id}: Read XML report ({len(report_xml_content)} bytes)")
+                except Exception as e:
+                    logger.error(f"Session {session_id}: Failed to read XML report: {e}")
+                break
+        
+        # Read HTML report if available
+        for filename in output_files:
+            if filename.endswith('-report.html') or filename == 'input-report.html':
+                html_path = os.path.join(output_dir, filename)
+                try:
+                    with open(html_path, 'r', encoding='utf-8') as f:
+                        report_html_content = f.read()
+                    logger.debug(f"Session {session_id}: Read HTML report ({len(report_html_content)} bytes)")
+                except Exception as e:
+                    logger.debug(f"Session {session_id}: HTML report not available or failed to read: {e}")
+                break
+    
+    if not report_xml_content:
+        logger.warning(f"Session {session_id}: No XML report content available")
+        report_xml_content = "Report XML not available"
+    
+    return KoSITReport(
+        report_xml=report_xml_content,
+        report_html=report_html_content
+    )
 
 
 def convert_flat_to_tiered(flat_error: dict, session_id: str) -> ValidationError:
@@ -709,6 +837,11 @@ async def validate_file(session_id: str, input_path: str, mode: OutputMode = Out
             "suppressed": False
         }
         
+        # For TIER0, try to include raw report even if parsing failed
+        kosit_report = None
+        if mode == OutputMode.TIER0:
+            kosit_report = read_report_files(output_dir, session_id)
+        
         return ValidationResponse(
             status="ERROR",
             meta=ValidationMeta(
@@ -717,11 +850,63 @@ async def validate_file(session_id: str, input_path: str, mode: OutputMode = Out
                 commit=config["commit_hash"]
             ),
             errors=[convert_flat_to_tiered(malformed_error, session_id)],
-            debug_log=str(e)
+            debug_log=str(e),
+            kosit=kosit_report
         )
     
     # ---------------------------------------------------------
-    # NEW: Dual-Mode Parser (KoSIT VARL + Standard SVRL)
+    # TIER0 MODE: Raw KoSIT findings only, no enrichment
+    # ---------------------------------------------------------
+    if mode == OutputMode.TIER0:
+        logger.info(f"Session {session_id}: Using TIER0 mode - raw KoSIT findings only")
+        errors = parse_kosit_report_tier0(root, session_id)
+        
+        # Read raw report files
+        kosit_report = read_report_files(output_dir, session_id)
+        
+        # Determine status
+        if errors:
+            validation_status = "REJECTED"
+            logger.info(f"Session {session_id}: Validation REJECTED ({len(errors)} finding(s))")
+        elif process.returncode != 0:
+            validation_status = "ERROR"
+            logger.error(f"Session {session_id}: Validator exited with error code {process.returncode} but no findings were parsed")
+            
+            # Create PARSING_MISMATCH error
+            parsing_error = ValidationError(
+                id="PARSER_ERROR",
+                severity="error",
+                action=ErrorAction(
+                    summary="The validator rejected the file, but the report could not be parsed.",
+                    fix="See rule description and correct the invoice data accordingly.",
+                    locations=[]
+                ),
+                evidence=None,
+                technical_details=DebugContext(
+                    raw_message="Validator exited with non-zero code but no findings parsed",
+                    raw_locations=[]
+                ),
+                suppressed=False
+            )
+            errors.append(parsing_error)
+        else:
+            validation_status = "PASSED"
+            logger.info(f"Session {session_id}: Validation PASSED")
+        
+        return ValidationResponse(
+            status=validation_status,
+            meta=ValidationMeta(
+                engine="KoSIT 1.5.0",
+                rules_tag="release-3.0.18",
+                commit=config["commit_hash"]
+            ),
+            errors=errors,
+            debug_log=None,
+            kosit=kosit_report
+        )
+    
+    # ---------------------------------------------------------
+    # ENRICHED MODES: Parse and apply humanization
     # ---------------------------------------------------------
     errors = []
     
@@ -923,6 +1108,132 @@ async def validate_file(session_id: str, input_path: str, mode: OutputMode = Out
         ),
         errors=errors,
         debug_log=None
+    )
+
+
+def parse_kosit_report_tier0(root: ET.Element, session_id: str) -> List[ValidationError]:
+    """
+    Parse KoSIT report in TIER0 mode - raw findings only, no enrichment.
+    
+    Args:
+        root: XML root element of KoSIT report
+        session_id: Session ID for logging
+        
+    Returns:
+        List of ValidationError objects with raw KoSIT data only
+    """
+    errors = []
+    failed_items = []
+    
+    # Parse both KoSIT VARL and Standard SVRL formats
+    for elem in root.iter():
+        tag_name = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+        
+        # KoSIT VARL Format: <rep:message code="BR-CO-15" level="error">Text</rep:message>
+        if tag_name == 'message':
+            error_code = elem.get('code')
+            if error_code:
+                failed_items.append({'type': 'kosit', 'elem': elem})
+        
+        # Standard SVRL Format: <svrl:failed-assert id="BR-CO-15"><svrl:text>Text</svrl:text>
+        elif tag_name == 'failed-assert':
+            failed_items.append({'type': 'svrl', 'elem': elem})
+    
+    logger.debug(f"Session {session_id}: Found {len(failed_items)} raw findings in TIER0 mode")
+    
+    for item in failed_items:
+        elem = item['elem']
+        
+        if item['type'] == 'kosit':
+            error_code = elem.get('code', 'UNKNOWN')
+            severity = elem.get('level', 'error')
+            raw_location = elem.get('xpathLocation', '')
+            raw_message = elem.text.strip() if elem.text else "Validation failed"
+        else:
+            error_code = elem.get('id') or elem.get('location') or "UNKNOWN"
+            severity = "error"
+            raw_location = elem.get('location', '')
+            raw_message = "Validation failed"
+            for child in elem:
+                child_tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                if child_tag == 'text' and child.text:
+                    raw_message = child.text.strip()
+                    break
+        
+        # TIER0: Create ValidationError with raw data only
+        # - action.summary = raw KoSIT message (verbatim)
+        # - action.fix = generic constant string
+        # - locations = raw locations from KoSIT
+        # - no evidence (TIER0 doesn't compute this)
+        # - technical_details preserved verbatim
+        error = ValidationError(
+            id=error_code,
+            severity=severity,
+            action=ErrorAction(
+                summary=raw_message,  # Verbatim KoSIT message
+                fix="See rule description and correct the invoice data accordingly.",  # Generic constant
+                locations=[raw_location] if raw_location else []
+            ),
+            evidence=None,  # No enrichment in TIER0
+            technical_details=DebugContext(
+                raw_message=raw_message,
+                raw_locations=[raw_location] if raw_location else []
+            ),
+            suppressed=False  # No suppression in TIER0
+        )
+        errors.append(error)
+    
+    return errors
+
+
+def read_report_files(output_dir: str, session_id: str) -> KoSITReport:
+    """
+    Read KoSIT report files (XML and optionally HTML).
+    
+    Args:
+        output_dir: Directory containing report files
+        session_id: Session ID for logging
+        
+    Returns:
+        KoSITReport object with report content
+    """
+    report_xml_content = None
+    report_html_content = None
+    
+    if os.path.exists(output_dir):
+        output_files = os.listdir(output_dir)
+        
+        # Read XML report
+        for filename in output_files:
+            if filename.endswith('-report.xml') or filename == 'input-report.xml':
+                xml_path = os.path.join(output_dir, filename)
+                try:
+                    with open(xml_path, 'r', encoding='utf-8') as f:
+                        report_xml_content = f.read()
+                    logger.debug(f"Session {session_id}: Read XML report ({len(report_xml_content)} bytes)")
+                except Exception as e:
+                    logger.error(f"Session {session_id}: Failed to read XML report: {e}")
+                break
+        
+        # Read HTML report if available
+        for filename in output_files:
+            if filename.endswith('-report.html') or filename == 'input-report.html':
+                html_path = os.path.join(output_dir, filename)
+                try:
+                    with open(html_path, 'r', encoding='utf-8') as f:
+                        report_html_content = f.read()
+                    logger.debug(f"Session {session_id}: Read HTML report ({len(report_html_content)} bytes)")
+                except Exception as e:
+                    logger.debug(f"Session {session_id}: HTML report not available or failed to read: {e}")
+                break
+    
+    if not report_xml_content:
+        logger.warning(f"Session {session_id}: No XML report content available")
+        report_xml_content = "Report XML not available"
+    
+    return KoSITReport(
+        report_xml=report_xml_content,
+        report_html=report_html_content
     )
 
 

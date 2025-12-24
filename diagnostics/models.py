@@ -11,6 +11,7 @@ from enum import Enum
 
 class OutputMode(str, Enum):
     """Output filtering modes for different user personas."""
+    TIER0 = "tier0"        # Raw KoSIT only: No enrichment, includes raw report
     SHORT = "short"        # Supplier: Only id, summary, fix
     BALANCED = "balanced"  # Developer: Add evidence, 3 sample locations, show suppressed
     DETAILED = "detailed"  # Auditor: Everything (all locations, raw logs)
@@ -53,3 +54,9 @@ class ValidationError(BaseModel):
     evidence: Optional[ErrorEvidence] = None
     technical_details: DebugContext
     suppressed: bool = False
+
+
+class KoSITReport(BaseModel):
+    """Raw KoSIT validation report content."""
+    report_xml: str  # Full XML report content
+    report_html: Optional[str] = None  # HTML report if available

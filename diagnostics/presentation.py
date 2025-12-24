@@ -31,7 +31,7 @@ def _normalize_mode(mode: Any) -> str:
         mode: Can be OutputMode enum, string, or any type with .value attribute
         
     Returns:
-        Normalized mode string: "short", "balanced", or "detailed"
+        Normalized mode string: "tier0", "short", "balanced", or "detailed"
         
     Raises:
         ValueError: If mode is invalid (strict behavior)
@@ -43,7 +43,7 @@ def _normalize_mode(mode: Any) -> str:
         mode_str = str(mode).lower()
     
     # Validate
-    valid_modes = {"short", "balanced", "detailed"}
+    valid_modes = {"tier0", "short", "balanced", "detailed"}
     if mode_str not in valid_modes:
         # Strict behavior: raise error for invalid mode
         raise ValueError(f"Invalid mode '{mode_str}'. Must be one of: {valid_modes}")
@@ -279,6 +279,45 @@ def _filter_detailed(errors: List[Any]) -> List[Dict[str, Any]]:
     return [error.model_dump(exclude_none=False) for error in errors]
 
 
+def _filter_tier0(errors: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Filter errors for TIER0 mode - raw KoSIT findings only.
+    No aggregation, no grouping, preserve order from KoSIT report.
+    
+    Output per error:
+    - id: Error identifier
+    - severity: Error severity
+    - action.summary: Raw KoSIT message (verbatim)
+    - action.fix: Generic constant string
+    - action.locations: Raw locations from KoSIT
+    - technical_details: Raw message and locations preserved
+    
+    Args:
+        errors: List of ValidationError objects
+        
+    Returns:
+        List of dicts with raw KoSIT data
+    """
+    result = []
+    for error in errors:
+        item = {
+            "id": error.id,
+            "severity": error.severity,
+            "action": {
+                "summary": error.action.summary,
+                "fix": error.action.fix,
+                "locations": error.action.locations
+            },
+            "technical_details": {
+                "raw_message": error.technical_details.raw_message,
+                "raw_locations": error.technical_details.raw_locations
+            }
+        }
+        result.append(item)
+    
+    return result
+
+
 def apply_mode_filter(mode: Any, validation_response: Any) -> Dict[str, Any]:
     """
     Apply presentation filtering based on output mode.
@@ -287,7 +326,7 @@ def apply_mode_filter(mode: Any, validation_response: Any) -> Dict[str, Any]:
     into a JSON-safe envelope appropriate for the user persona.
     
     Args:
-        mode: Output mode (SHORT, BALANCED, or DETAILED)
+        mode: Output mode (TIER0, SHORT, BALANCED, or DETAILED)
         validation_response: Full validation response from Brain
         
     Returns:
@@ -302,7 +341,9 @@ def apply_mode_filter(mode: Any, validation_response: Any) -> Dict[str, Any]:
     logger.debug(f"Applying {mode_str.upper()} mode filter")
     
     # Filter errors based on mode
-    if mode_str == "short":
+    if mode_str == "tier0":
+        diagnosis = _filter_tier0(validation_response.errors)
+    elif mode_str == "short":
         diagnosis = _filter_short(validation_response.errors)
     elif mode_str == "balanced":
         diagnosis = _filter_balanced(validation_response.errors)
@@ -311,12 +352,12 @@ def apply_mode_filter(mode: Any, validation_response: Any) -> Dict[str, Any]:
     
     # Build meta - handle both Pydantic and dict
     if hasattr(validation_response.meta, 'model_dump'):
-        if mode_str in ("short", "balanced"):
+        if mode_str in ("tier0", "short", "balanced"):
             meta_dict = validation_response.meta.model_dump(exclude_none=True, exclude_unset=True)
         else:  # detailed
             meta_dict = validation_response.meta.model_dump(exclude_none=False)
     elif isinstance(validation_response.meta, dict):
-        if mode_str in ("short", "balanced"):
+        if mode_str in ("tier0", "short", "balanced"):
             # Remove None values from dict
             meta_dict = {k: v for k, v in validation_response.meta.items() if v is not None}
         else:  # detailed
@@ -334,5 +375,12 @@ def apply_mode_filter(mode: Any, validation_response: Any) -> Dict[str, Any]:
     # Add debug_log only in DETAILED mode
     if mode_str == "detailed" and validation_response.debug_log:
         envelope["debug_log"] = validation_response.debug_log
+    
+    # Add raw KoSIT report in TIER0 mode
+    if mode_str == "tier0" and validation_response.kosit:
+        if hasattr(validation_response.kosit, 'model_dump'):
+            envelope["kosit"] = validation_response.kosit.model_dump(exclude_none=True)
+        else:
+            envelope["kosit"] = validation_response.kosit
     
     return envelope
